@@ -180,6 +180,12 @@ class Settings:
     sample_size: int
     sample_strategy: SampleStrategy
     rate_limit: int  # requests per second, across all APIs
+    # Concurrent workers per WorkerPool, i.e. requests in flight. Each Search
+    # API response takes ~0.75s, so a cursor chain manages only ~1.3 req/s on
+    # its own; enough chains must be in flight for rate_limit to be the binding
+    # constraint rather than this. Cache replays bypass the limiter entirely,
+    # so raising this also speeds up a full rebuild from disk.
+    workers: int
     max_partitions: int  # testing: harvest only the first N year partitions (0 = all)
     max_requests: int  # testing: cap search requests per partition (0 = unlimited)
 
@@ -209,10 +215,6 @@ class Settings:
     # dataset has "Newspapers" in its edm_datasetName, so require it.
     newspaper_dataset_substring: str = "newspapers"
 
-    # In-flight requests. Each Search API response takes ~0.75s, so a cursor
-    # chain manages only ~1.3 req/s on its own; enough chains must be in flight
-    # for rate_limit to be the binding constraint rather than this.
-    concurrency: int = 24
     items_flush_every: int = 200  # search requests per part-file flush
     entity_batch: int = 500  # resolved entities per part/checkpoint flush
     pages_batch: int = 25  # harvested items per part/checkpoint flush
@@ -315,6 +317,16 @@ class Schemas:
         ]
     )
 
+    # Raw IIIF Presentation manifests for the sampled issues: provenance for
+    # pages.parquet, at zero extra requests (the pages phase fetches them anyway).
+    MANIFESTS: ClassVar[pa.Schema] = pa.schema(
+        [
+            ("item_id", pa.string()),
+            ("manifest_url", pa.string()),
+            ("manifest", pa.string()),
+        ]
+    )
+
 
 # ---------------------------------------------------------------------------
 # State and storage
@@ -379,6 +391,7 @@ class EntitiesState:
 @dataclass
 class PagesState:
     part: int = 0
+    manifest_part: int = 0
     finalized: bool = False
 
 
@@ -511,15 +524,20 @@ class ParquetStore:
         base: str,
         schema: pa.Schema,
         split_bytes: int,
-        distinct_column: str,
+        group_column: str,
     ) -> tuple[int, int]:
         """Merge parts into shards of roughly `split_bytes` each.
 
-        Shards are named `{base}.parquet`, `{base}_001.parquet`, ... Returns
-        (rows written, distinct values seen in `distinct_column`).
+        Shards are named `{base}.parquet`, `{base}_001.parquet`, ... Rows whose
+        `group_column` value already appeared in an *earlier* part are dropped:
+        an interrupted run that lost its done-list append rewrites the whole
+        group into a later part, so keeping the first occurrence deduplicates
+        exactly the crash-replay window (repeats within one part are kept --
+        a group's rows always land in a single part). Returns (rows written,
+        distinct values of `group_column`).
         """
         parts = self.parts(pattern)
-        distinct: set[str] = set()
+        seen: set[str] = set()
         n_rows = 0
         shard_index = 0
         writer: pq.ParquetWriter | None = None
@@ -549,20 +567,28 @@ class ParquetStore:
             writer.write_table(pa.Table.from_pylist([], schema=schema))
         for part in parts:
             pf = pq.ParquetFile(part)
+            part_groups: set[str] = set()
             for rg in range(pf.num_row_groups):
                 table = pf.read_row_group(rg)
+                if table.num_rows and seen:
+                    table = table.filter(
+                        pc.invert(
+                            pc.is_in(table[group_column], value_set=pa.array(sorted(seen)))
+                        )
+                    )
                 if not table.num_rows:
                     continue
                 if writer is None:
                     open_writer()
                 writer.write_table(table)
                 n_rows += table.num_rows
-                distinct.update(table[distinct_column].to_pylist())
+                part_groups.update(table[group_column].to_pylist())
                 bytes_in_shard += table.nbytes
                 if bytes_in_shard >= split_bytes:
                     close_writer()
+            seen |= part_groups
         close_writer()
-        return n_rows, len(distinct)
+        return n_rows, len(seen)
 
     # -- reading ------------------------------------------------------------
 
@@ -1385,7 +1411,7 @@ class Phase(ABC):
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(drain())
-            failures = await WorkerPool(self._settings.concurrency).run(
+            failures = await WorkerPool(self._settings.workers).run(
                 jobs, lambda job: handler(job, results.put)
             )
             await results.put(None)  # sentinel: all workers are done
@@ -1529,7 +1555,7 @@ class ItemsPhase(Phase):
             counts[year] = count
 
         try:
-            failures = await WorkerPool(self._settings.concurrency).run(years, count_year)
+            failures = await WorkerPool(self._settings.workers).run(years, count_year)
         finally:
             pbar.close()
         if failures:
@@ -1962,12 +1988,42 @@ class PagesResult:
     rows: list[dict]
 
 
+@dataclass
+class PageRef:
+    """One canvas worth fetching: its annotation page plus the image facts
+    that come from the manifest rather than the annotation page."""
+
+    page_number: int
+    annopage_url: str
+    image_url: str | None
+    image_mime_type: str | None
+    image_width: int | None
+    image_height: int | None
+
+
+@dataclass
+class ItemPages:
+    """A sampled item with the page references its manifest yielded.
+
+    Kept even when `pages` is empty (failed or canvasless manifest, already
+    logged): the item must still reach the writer to be marked done.
+    """
+
+    item_id: str
+    pages: list[PageRef]
+
+
 class PagesPhase(Phase):
     """Fetch IIIF manifests and page text for a *sample* of issues.
 
     A sample, deliberately: the full corpus is ~15.7M pages, ~16.7M requests
     (one per page; the IIIF annotation API has no batch form) and ~950 GB, of
     which 90% is the word-level annotations column, not the text.
+
+    Two stages: all manifests first (~6% of the requests), which yields the
+    exact number of annotation pages to fetch -- so the page bar has a true
+    total and progresses smoothly -- then the pages themselves. The raw
+    manifests are persisted to manifests.parquet as provenance for the pages.
     """
 
     name = "pages"
@@ -1975,6 +2031,8 @@ class PagesPhase(Phase):
     SAMPLE_FILE: ClassVar[str] = "pages_sample.json"
 
     _pbar: tqdm | None = None
+    _items_done = 0  # completed items, shown as a bar postfix
+    _items_total = 0
 
     @property
     def _state(self) -> PagesState:
@@ -1998,13 +2056,16 @@ class PagesPhase(Phase):
         todo = [entry for entry in sample if entry["item_id"] not in done]
         if len(todo) < len(sample):
             self._echo(f"resuming: {len(sample) - len(todo)}/{len(sample)} items already harvested")
+
+        items = await self._fetch_manifests(todo)
+        total_pages = sum(len(item.pages) for item in items)
         self._results: list[PagesResult] = []
-        self._pbar = tqdm(
-            desc="pages", unit="item", total=len(sample), initial=len(sample) - len(todo)
-        )
+        self._items_done = 0
+        self._items_total = len(items)
+        self._pbar = tqdm(desc="pages", unit="page", total=total_pages)
         try:
             failures = await self._run_pipeline(
-                todo, self._harvest_item, self._write_result, self._flush
+                items, self._harvest_item, self._write_result, self._flush
             )
         finally:
             self._pbar.close()
@@ -2019,21 +2080,49 @@ class PagesPhase(Phase):
             "pages",
             Schemas.PAGES,
             self._settings.pages_split_bytes,
-            distinct_column="item_id",
+            group_column="item_id",
         )
+        n_manifests = self._merge_manifests()
         self._state.finalized = True
         self._checkpoint.save()
         self._metadata.update(
             "pages",
             {
                 "sampled_items": len(sample),
+                "manifests": n_manifests,
                 "items_with_pages": n_items,
                 "pages": n_pages,
             },
         )
         self._echo(
-            f"wrote {Fmt.count(n_pages)} pages from {n_items}/{len(sample)} sampled items"
+            f"wrote {Fmt.count(n_pages)} pages from {n_items}/{len(sample)} sampled "
+            f"items ({n_manifests} manifests)"
         )
+
+    def _merge_manifests(self) -> int:
+        """Merge manifest parts, deduplicated by item_id.
+
+        Duplicates exist only where a run was interrupted after persisting a
+        manifest but before its item completed: the resumed run refetches the
+        manifest (from cache) and writes it again.
+        """
+        parts = self._store.parts("manifests_*.parquet")
+        seen: set[str] = set()
+        n_manifests = 0
+        with self._store.open_output("manifests.parquet", Schemas.MANIFESTS) as writer:
+            if not parts:
+                writer.write_table(pa.Table.from_pylist([], schema=Schemas.MANIFESTS))
+            for part in parts:
+                keep = []
+                for row in pq.read_table(part).to_pylist():
+                    if row["item_id"] in seen:
+                        continue
+                    seen.add(row["item_id"])
+                    keep.append(row)
+                    n_manifests += 1
+                if keep:
+                    writer.write_table(pa.Table.from_pylist(keep, schema=Schemas.MANIFESTS))
+        return n_manifests
 
     def _load_or_build_sample(self, items_path: Path) -> list[dict]:
         path = self._store.parts_dir / self.SAMPLE_FILE
@@ -2065,68 +2154,147 @@ class PagesPhase(Phase):
         )
         return sample
 
-    async def _harvest_item(
-        self, entry: dict, emit: Callable[[PagesResult], Awaitable[None]]
-    ) -> None:
-        rows = await self._fetch_pages(entry["item_id"], entry["manifest_url"])
-        self._pbar.update(1)
-        await emit(PagesResult(entry["item_id"], rows))
+    # -- stage 1: manifests ------------------------------------------------------
 
-    async def _fetch_pages(self, item_id: str, manifest_url: str) -> list[dict]:
-        manifest = await self._api.manifest(manifest_url, item_id)
+    async def _fetch_manifests(self, todo: list[dict]) -> list[ItemPages]:
+        """Fetch every manifest up front and turn each into page references.
+
+        The raw manifest JSON is also persisted into part files here (merged
+        into manifests.parquet at finalize) -- provenance costs no extra
+        requests because these fetches happen regardless.
+        """
+        collected: list[ItemPages] = []
+        self._manifest_rows: list[dict] = []
+        pbar = tqdm(desc="pages: fetching manifests", unit="item", total=len(todo))
+
+        async def one(entry: dict, emit: Callable[[dict], Awaitable[None]]) -> None:
+            manifest = await self._api.manifest(entry["manifest_url"], entry["item_id"])
+            pbar.update(1)
+            collected.append(self._manifest_pages(entry, manifest))
+            if manifest is not None:
+                await emit(
+                    {
+                        "item_id": entry["item_id"],
+                        "manifest_url": entry["manifest_url"],
+                        "manifest": json.dumps(manifest, ensure_ascii=False),
+                    }
+                )
+
+        try:
+            failures = await self._run_pipeline(
+                todo, one, self._write_manifest, self._flush_manifests
+            )
+        finally:
+            pbar.close()
+        self._log_failures(failures)
+        if failures:
+            raise click.ClickException(
+                f"pages: {len(failures)} manifests hit unexpected errors; re-run to resume"
+            )
+        return collected
+
+    async def _write_manifest(self, row: dict) -> None:
+        self._manifest_rows.append(row)
+        if len(self._manifest_rows) >= self._settings.pages_batch:
+            await self._flush_manifests()
+
+    async def _flush_manifests(self) -> None:
+        if self._manifest_rows:
+            name = f"manifests_{self._state.manifest_part:05d}.parquet"
+            await asyncio.to_thread(
+                self._store.write_part, name, self._manifest_rows, Schemas.MANIFESTS
+            )
+            self._state.manifest_part += 1
+            self._manifest_rows = []
+            self._checkpoint.save()
+
+    def _manifest_pages(self, entry: dict, manifest: dict | None) -> ItemPages:
+        item_id = entry["item_id"]
         if manifest is None:
-            return []
+            return ItemPages(item_id, [])  # fetch failure, already logged
         canvases = manifest.get("items") or []
         if not canvases:
             # Some issues have a manifest but no canvases at all (an upstream
             # data gap, not a fetch failure). Without this they would drop out
             # of the sample silently.
-            self._errors.log("pages", item_id, f"manifest has no canvases: {manifest_url}")
-            return []
-        rows: list[dict] = []
-        # Canvases are fetched serially: page order stays trivial, and it is
-        # the concurrency across sampled items that saturates the rate limit.
+            self._errors.log("pages", item_id, f"manifest has no canvases: {entry['manifest_url']}")
+            return ItemPages(item_id, [])
+        pages: list[PageRef] = []
         for page_number, canvas in enumerate(canvases, start=1):
             try:
-                row = await self._fetch_page(item_id, page_number, canvas)
+                annotation_refs = canvas.get("annotations") or []
+                annopage_url = annotation_refs[0].get("id") if annotation_refs else None
+                if not annopage_url:
+                    self._errors.log(
+                        "pages", item_id, f"canvas {page_number}: no annotations reference"
+                    )
+                    continue
+                body = {}
+                canvas_items = canvas.get("items") or []
+                if canvas_items:
+                    painting_annos = canvas_items[0].get("items") or []
+                    if painting_annos:
+                        body = painting_annos[0].get("body") or {}
+                pages.append(
+                    PageRef(
+                        page_number=page_number,
+                        annopage_url=annopage_url,
+                        image_url=body.get("id"),
+                        image_mime_type=body.get("format"),
+                        image_width=canvas.get("width"),
+                        image_height=canvas.get("height"),
+                    )
+                )
             except Exception as exc:
                 self._errors.log(
                     "pages", item_id, f"canvas {page_number}: {type(exc).__name__}: {exc}"
                 )
-                continue
+        return ItemPages(item_id, pages)
+
+    # -- stage 2: annotation pages -----------------------------------------------
+
+    async def _harvest_item(
+        self, item: ItemPages, emit: Callable[[PagesResult], Awaitable[None]]
+    ) -> None:
+        rows: list[dict] = []
+        # Pages are fetched serially within an item; it is the concurrency
+        # across sampled items that saturates the rate limit.
+        for ref in item.pages:
+            try:
+                row = await self._fetch_page(item.item_id, ref)
+            except Exception as exc:
+                self._errors.log(
+                    "pages", item.item_id,
+                    f"canvas {ref.page_number}: {type(exc).__name__}: {exc}",
+                )
+                row = None
+            self._pbar.update(1)
             if row is not None:
                 rows.append(row)
-        return rows
+        self._items_done += 1
+        self._pbar.set_postfix_str(
+            f"{self._items_done}/{self._items_total} items", refresh=False
+        )
+        await emit(PagesResult(item.item_id, rows))
 
-    async def _fetch_page(self, item_id: str, page_number: int, canvas: dict) -> dict | None:
-        annotation_refs = canvas.get("annotations") or []
-        annopage_url = annotation_refs[0].get("id") if annotation_refs else None
-        if not annopage_url:
-            self._errors.log("pages", item_id, f"canvas {page_number}: no annotations reference")
-            return None
-        body = {}
-        canvas_items = canvas.get("items") or []
-        if canvas_items:
-            painting_annos = canvas_items[0].get("items") or []
-            if painting_annos:
-                body = painting_annos[0].get("body") or {}
-        data = await self._api.annopage(annopage_url, item_id)
+    async def _fetch_page(self, item_id: str, ref: PageRef) -> dict | None:
+        data = await self._api.annopage(ref.annopage_url, item_id)
         if data is None:
             return None
-        page = self._parser.parse(data, annopage_url, item_id)
+        page = self._parser.parse(data, ref.annopage_url, item_id)
         if page is None:
             return None
         return {
             "item_id": item_id,
-            "page_number": page_number,
+            "page_number": ref.page_number,
             "page_id": page["page_id"],
             "text": page["text"],
-            "image_url": body.get("id"),
-            "image_mime_type": body.get("format"),
+            "image_url": ref.image_url,
+            "image_mime_type": ref.image_mime_type,
             "annotations": page["annotations_json"],
             "language": page["language"],
-            "image_width": canvas.get("width"),
-            "image_height": canvas.get("height"),
+            "image_width": ref.image_width,
+            "image_height": ref.image_height,
             "text_length": len(page["text"]),
             "text_rights": page["text_rights"],
         }
@@ -2235,9 +2403,19 @@ class BuildPipeline:
 @click.option(
     "--rate-limit",
     type=click.IntRange(min=1),
-    default=5,
+    default=10,
     show_default=True,
     help="Max requests per second sent to the Europeana APIs",
+)
+@click.option(
+    "--workers",
+    type=click.IntRange(min=1),
+    default=24,
+    show_default=True,
+    help=(
+        "Concurrent requests in flight; cache replays bypass the rate limit, "
+        "so more workers also speed up rebuilds from disk"
+    ),
 )
 @click.option(
     "--max-partitions",
@@ -2259,6 +2437,7 @@ def main(
     sample_size: int,
     sample_strategy: str,
     rate_limit: int,
+    workers: int,
     max_partitions: int,
     max_requests: int,
 ) -> None:
@@ -2275,6 +2454,7 @@ def main(
         sample_size=sample_size,
         sample_strategy=SampleStrategy(sample_strategy),
         rate_limit=rate_limit,
+        workers=workers,
         max_partitions=max_partitions,
         max_requests=max_requests,
     )

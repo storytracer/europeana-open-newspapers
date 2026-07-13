@@ -28,6 +28,7 @@ dependencies on first run, so there is no virtualenv or `pip install` step.
 | `pages.parquet` | page | OCR text, image URL and dimensions, word-level annotations as JSON |
 | `enrichments.parquet` | item→entity edge | which entity each item links to, and via which property |
 | `entities.parquet` | entity fact | labels, coordinates, date ranges for concepts, agents, places and timespans |
+| `manifests.parquet` | sampled issue | the raw IIIF Presentation manifest JSON — provenance for `pages.parquet` |
 
 Every issue has an exact publication date: `year_issued` (int) and `date_issued` (date).
 
@@ -43,7 +44,8 @@ Alongside them: `metadata.json` (counts, harvest date, endpoints used),
 --phase [items|entities|pages|all]        Run one phase or all three   [default: all]
 --sample-size INTEGER                     Issues to harvest page text for  [default: 1000]
 --sample-strategy [proportional|balanced] Shape of that sample  [default: proportional]
---rate-limit INTEGER                      Requests per second to the APIs  [default: 5]
+--rate-limit INTEGER                      Requests per second to the APIs  [default: 10]
+--workers INTEGER                         Concurrent requests in flight  [default: 24]
 --output-dir PATH                         [default: data/output]
 --cache-dir PATH                          [default: data/cache/http]
 --refresh-cache                           Clear the HTTP cache before starting
