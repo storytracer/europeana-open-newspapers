@@ -28,7 +28,7 @@ import random
 import re
 import shutil
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -130,6 +130,11 @@ URI_TYPE_TO_CLASS = {
 CHAR_RE = re.compile(r"#char=(\d+),(\d+)")
 XYWH_RE = re.compile(r"#xywh=(\d+),(\d+),(\d+),(\d+)")
 
+# Every dc_title in the corpus ends in the issue date ("Lienzer Zeitung - 1941-11-15"),
+# in all 11 datasets, for all 995k items. That is the only source of the *exact* date:
+# proxy_dcterms_issued can be filtered but never read (see year_issued).
+TITLE_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+
 ITEMS_SCHEMA = pa.schema(
     [
         ("item_id", pa.string()),
@@ -149,6 +154,8 @@ ITEMS_SCHEMA = pa.schema(
         # Derived from the harvest partition, not from the payload: the Search API can
         # filter on proxy_dcterms_issued but never returns it, on any profile.
         ("year_issued", pa.int16()),
+        # Parsed out of dc_title, which ends in the issue date for every item.
+        ("date_issued", pa.date32()),
         ("data_provider", pa.string()),
         ("provider", pa.string()),
         ("dataset_name", pa.string()),
@@ -398,6 +405,32 @@ def entity_class_for(uri: str, fallback: str) -> str:
     return URI_TYPE_TO_CLASS[m.group(1)] if m else fallback
 
 
+def date_from_title(titles: dict, year: int, item_uri: str) -> date | None:
+    """Exact issue date out of the dc_title labels, e.g. "Lienzer Zeitung - 1941-11-15".
+
+    The title is a display label while the year came from the dcterms:issued index, so
+    the two can disagree (one item in ~995k does, across a New Year boundary). Both are
+    kept as harvested; the disagreement is logged rather than quietly reconciled.
+    """
+    text = " ".join(v for values in titles.values() for v in values)
+    match = TITLE_DATE_RE.search(text)
+    if not match:
+        log_error("items", item_uri, f"no date in title: {text[:80]!r}")
+        return None
+    try:
+        issued = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        log_error("items", item_uri, f"invalid date in title: {match.group(0)}")
+        return None
+    if issued.year != year:
+        log_error(
+            "items",
+            item_uri,
+            f"title date {issued} disagrees with dcterms:issued year {year}",
+        )
+    return issued
+
+
 def is_newspaper_dataset(dataset_name: str | None) -> bool:
     return bool(dataset_name) and NEWSPAPER_DATASET_SUBSTRING in dataset_name.lower()
 
@@ -409,6 +442,7 @@ def extract_item(item: dict, year: int) -> tuple[dict, list[dict], list[tuple[st
     """
     iid = item["id"]
     item_uri = ITEM_URI_PREFIX + iid
+    titles = item.get("dcTitleLangAware", {})
 
     row = {
         "item_id": item_uri,
@@ -420,7 +454,7 @@ def extract_item(item: dict, year: int) -> tuple[dict, list[dict], list[tuple[st
             ),
             None,
         ),
-        "dc_title": json.dumps(item.get("dcTitleLangAware", {}), ensure_ascii=False),
+        "dc_title": json.dumps(titles, ensure_ascii=False),
         "dc_description": dumps_or_none(item.get("dcDescriptionLangAware")),
         "dc_type": dumps_or_none(item.get("dcTypeLangAware")),
         "dc_type_en": None,
@@ -433,6 +467,7 @@ def extract_item(item: dict, year: int) -> tuple[dict, list[dict], list[tuple[st
         "language": first_or_none(item.get("language", [])),
         "country": first_or_none(item.get("country", [])),
         "year_issued": year,
+        "date_issued": date_from_title(titles, year, item_uri),
         "data_provider": first_or_none(item.get("dataProvider", [])),
         "provider": first_or_none(item.get("provider", [])),
         "dataset_name": first_or_none(item.get("edmDatasetName", [])),
@@ -1164,8 +1199,14 @@ async def harvest_item_pages(
     )
     if manifest is None:
         return []
+    canvases = manifest.get("items") or []
+    if not canvases:
+        # Some issues have a manifest but no canvases at all (an upstream data gap, not
+        # a fetch failure). Without this they would drop out of the sample silently.
+        log_error("pages", item_id, f"manifest has no canvases: {manifest_url}")
+        return []
     rows: list[dict] = []
-    for page_number, canvas in enumerate(manifest.get("items") or [], start=1):
+    for page_number, canvas in enumerate(canvases, start=1):
         try:
             annotation_refs = canvas.get("annotations") or []
             annopage_url = annotation_refs[0].get("id") if annotation_refs else None
