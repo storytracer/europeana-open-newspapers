@@ -21,6 +21,7 @@ Phases: items -> entities -> pages (all three run with --phase all).
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -134,11 +135,22 @@ XYWH_RE = re.compile(r"#xywh=(\d+),(\d+),(\d+),(\d+)")
 # in all 11 datasets, for all 995k items. That is the only source of the *exact* date:
 # proxy_dcterms_issued can be filtered but never read (see year_issued).
 TITLE_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+# Issue numbering that some datasets append to the title ("..., nr: 16", "... no. 4").
+TITLE_ISSUE_RE = re.compile(r"[,;]?\s*(nr|no|n°|nº|num|issue)\b\.?:?\s*\d+", re.IGNORECASE)
 
 ITEMS_SCHEMA = pa.schema(
     [
         ("item_id", pa.string()),
-        ("parent_id", pa.string()),
+        ("language", pa.string()),
+        ("country", pa.string()),
+        # Derived from the harvest partition, not from the payload: the Search API can
+        # filter on proxy_dcterms_issued but never returns it, on any profile.
+        ("year_issued", pa.int16()),
+        # Parsed out of dc_title, which ends in the issue date for every item.
+        ("date_issued", pa.date32()),
+        ("dataset_name", pa.string()),
+        ("europeana_url", pa.string()),
+        ("manifest_url", pa.string()),
         ("dc_title", pa.string()),
         ("dc_description", pa.string()),
         ("dc_type", pa.string()),
@@ -149,20 +161,10 @@ ITEMS_SCHEMA = pa.schema(
         ("enriched_agents", pa.string()),
         ("enriched_places", pa.string()),
         ("enriched_timespans", pa.string()),
-        ("language", pa.string()),
-        ("country", pa.string()),
-        # Derived from the harvest partition, not from the payload: the Search API can
-        # filter on proxy_dcterms_issued but never returns it, on any profile.
-        ("year_issued", pa.int16()),
-        # Parsed out of dc_title, which ends in the issue date for every item.
-        ("date_issued", pa.date32()),
         ("data_provider", pa.string()),
-        ("provider", pa.string()),
-        ("dataset_name", pa.string()),
-        ("manifest_url", pa.string()),
-        ("europeana_url", pa.string()),
         ("image_rights", pa.string()),
         ("theme", pa.string()),
+        ("provider", pa.string()),
     ]
 )
 
@@ -171,11 +173,11 @@ PAGES_SCHEMA = pa.schema(
         ("item_id", pa.string()),
         ("page_number", pa.int16()),
         ("page_id", pa.string()),
+        ("language", pa.string()),
         ("text", pa.string()),
+        ("annotations", pa.string()),
         ("image_url", pa.string()),
         ("image_mime_type", pa.string()),
-        ("annotations", pa.string()),
-        ("language", pa.string()),
         ("image_width", pa.int32()),
         ("image_height", pa.int32()),
         ("text_length", pa.int32()),
@@ -446,14 +448,6 @@ def extract_item(item: dict, year: int) -> tuple[dict, list[dict], list[tuple[st
 
     row = {
         "item_id": item_uri,
-        "parent_id": next(
-            (
-                v
-                for v in item.get("dctermsIsPartOf", [])
-                if isinstance(v, str) and v.startswith("http://")
-            ),
-            None,
-        ),
         "dc_title": json.dumps(titles, ensure_ascii=False),
         "dc_description": dumps_or_none(item.get("dcDescriptionLangAware")),
         "dc_type": dumps_or_none(item.get("dcTypeLangAware")),
@@ -1083,49 +1077,163 @@ def postprocess_items(output_dir: Path, parts_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_sample(items_path: Path, max_items: int) -> list[dict]:
-    """Pick up to max_items per dataset, round-robining across dc_type values.
+def newspaper_title(dc_title: str | None) -> str:
+    """The newspaper's name, with the issue-specific tail stripped off.
 
-    Grouped by dataset_name rather than data_provider: dataset_name is a controlled
-    identifier assigned at ingest, whereas data_provider is a free-text label with
-    spelling variants (the Austrian National Library appears under two names for a
-    single dataset, and grouping by provider would hand it a double quota).
+    Titles carry the issue date and often an issue number ("Hufvudstadsbladet, nr: 16 -
+    1900-08-09"); both have to go, or every issue looks like its own newspaper and the
+    title round-robin below does nothing.
     """
-    groups: dict[str, dict[str, list[tuple[str, str]]]] = defaultdict(lambda: defaultdict(list))
+    if not dc_title:
+        return ""
+    text = " ".join(v for values in json.loads(dc_title).values() for v in values)
+    text = TITLE_DATE_RE.sub("", text)
+    text = TITLE_ISSUE_RE.sub("", text)
+    return text.strip(" -–,;:") or ""
+
+
+def allocate(quota: int, sizes: dict) -> dict:
+    """Split `quota` across strata proportionally to `sizes`, but never starve one.
+
+    Every non-empty stratum gets at least one item (up to what it holds); the rest is
+    handed out by largest remainder. Without the floor, a proportional split silently
+    drops whole decades -- the 1820s are 3.7% of the corpus and rounded to zero before.
+    """
+    strata = {k: v for k, v in sizes.items() if v}
+    if not strata:
+        return {}
+    alloc = {k: 1 for k in strata}  # the floor
+    if sum(alloc.values()) > quota:  # more strata than quota: keep the biggest ones
+        keep = sorted(strata, key=lambda k: (-strata[k], k))[:quota]
+        return {k: 1 for k in keep}
+
+    total = sum(strata.values())
+    remaining = quota - len(alloc)
+    shares = {k: remaining * n / total for k, n in strata.items()}
+    for k in shares:
+        alloc[k] += int(shares[k])
+    # largest remainder for the leftovers
+    leftover = quota - sum(alloc.values())
+    for k in sorted(shares, key=lambda k: (-(shares[k] % 1), k))[:leftover]:
+        alloc[k] += 1
+    # never allocate more than a stratum actually holds
+    for k in alloc:
+        alloc[k] = min(alloc[k], strata[k])
+    return alloc
+
+
+def allocate_equal(quota: int, capacities: dict) -> dict:
+    """Split `quota` as evenly as possible, without exceeding what each stratum holds.
+
+    Whatever a small stratum cannot absorb is redistributed among the others, so
+    `--sample-strategy balanced --sample-size 1000` still yields 1000 items even though
+    Luxembourg only has 1,317 to give.
+    """
+    alloc = dict.fromkeys(capacities, 0)
+    open_strata = {k for k, v in capacities.items() if v}
+    remaining = quota
+    while remaining and open_strata:
+        share, extra = divmod(remaining, len(open_strata))
+        if not share:  # fewer left than strata: hand them out one by one, biggest first
+            for k in sorted(open_strata, key=lambda k: (-capacities[k], k))[:extra]:
+                alloc[k] += 1
+            break
+        progressed = False
+        for k in sorted(open_strata):
+            room = capacities[k] - alloc[k]
+            take = min(share, room)
+            alloc[k] += take
+            remaining -= take
+            if take:
+                progressed = True
+            if alloc[k] >= capacities[k]:
+                open_strata.discard(k)
+        if not progressed:
+            break
+    return {k: v for k, v in alloc.items() if v}
+
+
+def build_sample(items_path: Path, sample_size: int, strategy: str) -> list[dict]:
+    """Pick `sample_size` issues in total, stratified all the way down.
+
+    strategy:
+      proportional -- each dataset's share mirrors its share of the corpus, so the
+                      sample is a miniature of the real thing (a third of it Dutch).
+      balanced     -- every dataset gets an equal share, so small collections are as
+                      visible as large ones. Not representative, but diverse.
+
+    Under either strategy the quota is then split the same way, because the corpus is
+    lopsided in three different directions at once:
+      * decade  -- proportional within the dataset, floor of 1, so no period vanishes
+      * title   -- round-robin, so one newspaper cannot eat a whole dataset's quota
+      * issue   -- ordered by a hash of the item id, not lexicographically
+
+    Datasets are keyed on dataset_name, not data_provider: data_provider is a free-text
+    label with spelling variants (the Austrian National Library appears under two names
+    for a single dataset, and would draw a double quota).
+
+    That last stratum matters more than it looks: item ids sort by title and then by
+    date, so taking the first N gave 25 consecutive issues of one newspaper. The hash is
+    md5, not hash(), which is salted per process and would make runs unreproducible.
+    """
+    # dataset -> decade -> title -> [(sort_key, item_id, manifest_url)]
+    groups: dict[str, dict[int, dict[str, list]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
+    )
     for batch in iter_item_batches(
-        items_path, columns=["item_id", "dataset_name", "dc_type", "manifest_url"]
+        items_path,
+        columns=["item_id", "dataset_name", "dc_title", "year_issued", "manifest_url"],
     ):
-        for iid, dataset, dc_type, manifest_url in zip(
+        for iid, dataset, dc_title, year, manifest_url in zip(
             batch["item_id"].to_pylist(),
             batch["dataset_name"].to_pylist(),
-            batch["dc_type"].to_pylist(),
+            batch["dc_title"].to_pylist(),
+            batch["year_issued"].to_pylist(),
             batch["manifest_url"].to_pylist(),
         ):
-            groups[dataset or ""][dc_type or ""].append((iid, manifest_url))
+            decade = (year // 10 * 10) if year is not None else 0
+            key = hashlib.md5(iid.encode("utf-8")).hexdigest()
+            groups[dataset or ""][decade][newspaper_title(dc_title)].append(
+                (key, iid, manifest_url)
+            )
+
+    dataset_size = {
+        ds: sum(len(v) for titles in decades.values() for v in titles.values())
+        for ds, decades in groups.items()
+    }
+    if strategy == "balanced":
+        per_dataset = allocate_equal(sample_size, dataset_size)
+    else:
+        per_dataset = allocate(sample_size, dataset_size)
 
     sample: list[dict] = []
     for dataset in sorted(groups):
-        buckets = groups[dataset]
-        keys = sorted(buckets)
-        for key in keys:
-            buckets[key].sort()
-        pointers = dict.fromkeys(keys, 0)
-        picked = 0
-        while picked < max_items:
-            progressed = False
-            for key in keys:
-                bucket = buckets[key]
-                pos = pointers[key]
-                if pos < len(bucket):
-                    iid, manifest_url = bucket[pos]
-                    sample.append({"item_id": iid, "manifest_url": manifest_url})
-                    pointers[key] = pos + 1
-                    picked += 1
-                    progressed = True
-                    if picked >= max_items:
-                        break
-            if not progressed:
-                break
+        decades = groups[dataset]
+        per_decade = allocate(
+            per_dataset.get(dataset, 0),
+            {d: sum(len(v) for v in titles.values()) for d, titles in decades.items()},
+        )
+        for decade in sorted(per_decade):
+            titles = decades[decade]
+            for issues in titles.values():
+                issues.sort()  # by md5 -> deterministic, but not by title/date
+            order = sorted(titles, key=lambda t: (-len(titles[t]), t))
+            pointers = dict.fromkeys(order, 0)
+            picked = 0
+            while picked < per_decade[decade]:
+                progressed = False
+                for title in order:  # round-robin across newspapers
+                    pos = pointers[title]
+                    if pos < len(titles[title]):
+                        _, iid, manifest_url = titles[title][pos]
+                        sample.append({"item_id": iid, "manifest_url": manifest_url})
+                        pointers[title] = pos + 1
+                        picked += 1
+                        progressed = True
+                        if picked >= per_decade[decade]:
+                            break
+                if not progressed:
+                    break
     return sample
 
 
@@ -1292,7 +1400,12 @@ def finalize_pages(output_dir: Path, parts_dir: Path) -> tuple[int, int]:
 
 
 async def phase_pages(
-    client: httpx.AsyncClient, output_dir: Path, parts_dir: Path, ckpt: dict, max_items: int
+    client: httpx.AsyncClient,
+    output_dir: Path,
+    parts_dir: Path,
+    ckpt: dict,
+    sample_size: int,
+    strategy: str,
 ) -> None:
     items_path = output_dir / "items.parquet"
     if not items_path.exists():
@@ -1307,13 +1420,16 @@ async def phase_pages(
     sample = None
     if sample_path.exists():
         stored = json.loads(sample_path.read_text(encoding="utf-8"))
-        if stored.get("max_items") == max_items:
+        # Reuse the stored sample only if both knobs still match, otherwise the run
+        # would resume against a sample that is not the one being asked for.
+        if (stored.get("sample_size"), stored.get("strategy")) == (sample_size, strategy):
             sample = stored["sample"]
     if sample is None:
-        click.echo("pages: building sample from items.parquet ...")
-        sample = build_sample(items_path, max_items)
+        click.echo(f"pages: building {strategy} sample of {sample_size} items ...")
+        sample = build_sample(items_path, sample_size, strategy)
         sample_path.write_text(
-            json.dumps({"max_items": max_items, "sample": sample}), encoding="utf-8"
+            json.dumps({"sample_size": sample_size, "strategy": strategy, "sample": sample}),
+            encoding="utf-8",
         )
 
     done_path = parts_dir / "pages_done.txt"
@@ -1366,7 +1482,8 @@ async def run_phases(
     output_dir: Path,
     cache_dir: Path,
     parts_dir: Path,
-    max_items: int,
+    sample_size: int,
+    sample_strategy: str,
     rate_limit: int,
 ) -> None:
     ckpt = load_checkpoint(output_dir)
@@ -1377,7 +1494,9 @@ async def run_phases(
             elif phase == "entities":
                 await phase_entities(client, api_key, output_dir, parts_dir, ckpt)
             elif phase == "pages":
-                await phase_pages(client, output_dir, parts_dir, ckpt, max_items)
+                await phase_pages(
+                    client, output_dir, parts_dir, ckpt, sample_size, sample_strategy
+                )
 
 
 @click.command()
@@ -1404,11 +1523,21 @@ async def run_phases(
     help="Run a specific phase or all",
 )
 @click.option(
-    "--max-items",
-    type=int,
-    default=100,
+    "--sample-size",
+    type=click.IntRange(min=1),
+    default=1000,
     show_default=True,
-    help="Max items per dataset for the page sample",
+    help="Total number of issues to harvest page text for",
+)
+@click.option(
+    "--sample-strategy",
+    type=click.Choice(["proportional", "balanced"]),
+    default="proportional",
+    show_default=True,
+    help=(
+        "proportional: each dataset's share mirrors the corpus (representative); "
+        "balanced: every dataset gets an equal share (diverse)"
+    ),
 )
 @click.option(
     "--rate-limit",
@@ -1422,7 +1551,8 @@ def main(
     cache_dir: Path,
     refresh_cache: bool,
     phase: str,
-    max_items: int,
+    sample_size: int,
+    sample_strategy: str,
     rate_limit: int,
 ):
     """Harvest the Europeana Open Newspapers dataset into Parquet files."""
@@ -1445,7 +1575,10 @@ def main(
         )
 
     asyncio.run(
-        run_phases(phases, api_key, output_dir, cache_dir, parts_dir, max_items, rate_limit)
+        run_phases(
+            phases, api_key, output_dir, cache_dir, parts_dir,
+            sample_size, sample_strategy, rate_limit,
+        )
     )
 
 
