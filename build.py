@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 from collections import defaultdict
@@ -96,7 +97,11 @@ def year_qf(year: int) -> str:
 NEWSPAPER_DATASET_SUBSTRING = "newspapers"
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
-MAX_ATTEMPTS = 5
+# Europeana returns 502s under load that can last minutes. A cursor chain cannot skip a
+# page, so a give-up costs the whole partition; ride the outage out instead. These
+# attempts span ~4 minutes of backoff (2+4+8+16+32+60+60s, plus jitter).
+MAX_ATTEMPTS = 8
+BACKOFF_CAP = 60
 # In-flight requests. Each Search API response takes ~0.75s, so a chain manages only
 # ~1.3 req/s on its own; enough chains must be in flight for --rate-limit to be the
 # binding constraint rather than this.
@@ -317,7 +322,10 @@ async def fetch_json(
     last_err = None
     for attempt in range(MAX_ATTEMPTS):
         if attempt:
-            await asyncio.sleep(min(2**attempt, 30))
+            # Jitter so that concurrent chains hit by the same outage do not retry in
+            # lockstep and re-spike the server the moment it comes back.
+            delay = min(2**attempt, BACKOFF_CAP)
+            await asyncio.sleep(delay * (0.5 + random.random()))
         try:
             resp = await client.get(url, params=params, headers=headers)
         except httpx.HTTPError as exc:
@@ -671,19 +679,36 @@ async def phase_items(
             desc="items: search pages", unit="req", total=expected, initial=done_requests
         )
         try:
-            await asyncio.gather(
+            # return_exceptions: one year hitting an API outage must not abandon the
+            # other 300+ chains mid-flight. Failures are collected and reported below.
+            results = await asyncio.gather(
                 *(
                     harvest_year(
                         client, api_key, int(y), st, output_dir, parts_dir, ckpt, pbar, semaphore
                     )
                     for y in years
-                )
+                ),
+                return_exceptions=True,
             )
         finally:
             pbar.close()
 
+        for year, result in zip(years, results):
+            if isinstance(result, BaseException):
+                log_error("items", f"year {year}", f"{type(result).__name__}: {result}")
+
         st["done"] = all(st["partitions"][y]["done"] for y in years)
         save_checkpoint(output_dir, ckpt)
+
+        # Finalizing marks the phase complete and makes every future run skip it. Doing
+        # that with years still missing would silently ship a dataset with holes in it.
+        if not st["done"]:
+            incomplete = [y for y in years if not st["partitions"][y]["done"]]
+            raise click.ClickException(
+                f"items: {len(incomplete)} of {len(years)} year partitions incomplete "
+                f"({', '.join(incomplete[:10])}{' ...' if len(incomplete) > 10 else ''}). "
+                f"Nothing was finalized; re-run the same command to resume."
+            )
 
     finalize_items(output_dir, parts_dir, st)
     save_checkpoint(output_dir, ckpt)
