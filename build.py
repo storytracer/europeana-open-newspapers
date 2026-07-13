@@ -57,14 +57,37 @@ IIIF_PRESENTATION = "https://iiif.europeana.eu/presentation"
 DATA_EUROPEANA_PREFIX = "http://data.europeana.eu/"
 ITEM_URI_PREFIX = "http://data.europeana.eu/item"
 
+# The corpus is defined as date-bearing: every item must carry a dcterms:issued date.
+# This drops a single dateless record from ~995k, and in exchange the whole dataset is
+# partitionable and filterable by year.
+#
+# IMPORTANT: Europeana ORs multiple qf values on the SAME field (different fields are
+# ANDed). So ISSUED_PRESENT must never be sent alongside a year range on
+# proxy_dcterms_issued -- "has a date OR is from 1873" matches the whole corpus. A year
+# range already implies the field is present, so partition queries send only the range;
+# ISSUED_PRESENT is used on its own, to count the date-bearing corpus.
+ISSUED_PRESENT = "proxy_dcterms_issued:[* TO *]"
+
 SEARCH_PARAMS = {
     "query": "*",
     "reusability": "open",
-    "qf": "TYPE:TEXT",
+    "qf": ["TYPE:TEXT"],  # list -> repeated qf params; callers append exactly one more
     "theme": "newspaper",
     "rows": "100",
     "profile": "rich",
 }
+
+# Publication years spanned by the corpus (upper bound exclusive). Verified against the
+# API: nothing sits outside 1600-1950. discover_year_partitions() asserts that the
+# per-year counts still sum to totalResults, so a corpus that grows past these bounds
+# fails loudly rather than being silently truncated.
+YEAR_MIN = 1600
+YEAR_MAX = 1950
+
+
+def year_qf(year: int) -> str:
+    """Half-open range for one year: [Y TO Y+1}, so adjacent years cannot overlap."""
+    return f"proxy_dcterms_issued:[{year} TO {year + 1}}}"
 
 # The theme=newspaper query also returns a handful of records from collections that
 # are not newspaper collections at all (e.g. 135_Ag_EU_1989_Germany, a crowdsourced
@@ -74,16 +97,20 @@ NEWSPAPER_DATASET_SUBSTRING = "newspapers"
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 5
-CONCURRENCY = 8
+# In-flight requests. Each Search API response takes ~0.75s, so a chain manages only
+# ~1.3 req/s on its own; enough chains must be in flight for --rate-limit to be the
+# binding constraint rather than this.
+CONCURRENCY = 24
 RATE_LIMIT = 5  # requests per second, across all APIs; override with --rate-limit
 ITEMS_FLUSH_EVERY = 200  # search requests per part-file flush
 ENTITY_CHUNK = 500
 PAGES_CHUNK = 25
 PAGES_SPLIT_BYTES = 1 << 30
 
-# Hidden testing hook: caps the number of cursor requests per Search API loop
-# so the whole pipeline can be exercised on a small corpus. Not a CLI flag.
+# Hidden testing hooks: cap the requests per cursor chain and the number of year
+# partitions, so the whole pipeline can be exercised on a small corpus. Not CLI flags.
 MAX_REQUESTS_ENV = "EOT_MAX_REQUESTS"
+MAX_PARTITIONS_ENV = "EOT_MAX_PARTITIONS"
 
 ENTITY_URI_RE = re.compile(
     r"^http://data\.europeana\.eu/(concept|agent|place|timespan)/(?:base/)?(\d+)$"
@@ -113,7 +140,9 @@ ITEMS_SCHEMA = pa.schema(
         ("enriched_timespans", pa.string()),
         ("language", pa.string()),
         ("country", pa.string()),
-        ("edm_year", pa.string()),
+        # Derived from the harvest partition, not from the payload: the Search API can
+        # filter on proxy_dcterms_issued but never returns it, on any profile.
+        ("year_issued", pa.int16()),
         ("data_provider", pa.string()),
         ("provider", pa.string()),
         ("dataset_name", pa.string()),
@@ -364,8 +393,11 @@ def is_newspaper_dataset(dataset_name: str | None) -> bool:
     return bool(dataset_name) and NEWSPAPER_DATASET_SUBSTRING in dataset_name.lower()
 
 
-def extract_item(item: dict) -> tuple[dict, list[dict], list[tuple[str, str]]]:
-    """One Search API item -> (item row, enrichment edge rows, third-party label hints)."""
+def extract_item(item: dict, year: int) -> tuple[dict, list[dict], list[tuple[str, str]]]:
+    """One Search API item -> (item row, enrichment edge rows, third-party label hints).
+
+    `year` is the publication year of the partition this item was harvested from.
+    """
     iid = item["id"]
     item_uri = ITEM_URI_PREFIX + iid
 
@@ -391,7 +423,7 @@ def extract_item(item: dict) -> tuple[dict, list[dict], list[tuple[str, str]]]:
         "enriched_timespans": None,
         "language": first_or_none(item.get("language", [])),
         "country": first_or_none(item.get("country", [])),
-        "edm_year": dumps_or_none(item.get("year")),
+        "year_issued": year,
         "data_provider": first_or_none(item.get("dataProvider", [])),
         "provider": first_or_none(item.get("provider", [])),
         "dataset_name": first_or_none(item.get("edmDatasetName", [])),
@@ -446,72 +478,156 @@ def extract_item(item: dict) -> tuple[dict, list[dict], list[tuple[str, str]]]:
     return row, edge_rows, hints
 
 
-async def search_cursor_loop(
+async def count_results(client: httpx.AsyncClient, api_key: str, extra_qf: list[str]) -> int | None:
+    """totalResults for the base query plus extra qf filters (rows=0, so no items)."""
+    params = dict(SEARCH_PARAMS)
+    params["qf"] = SEARCH_PARAMS["qf"] + extra_qf
+    params["rows"] = "0"
+    params["cursor"] = "*"
+    data = await fetch_json(
+        client,
+        FULLTEXT_SEARCH_API,
+        params=params,
+        headers={"x-api-key": api_key},
+        phase="items",
+        record_id=" ".join(extra_qf) or "corpus",
+    )
+    if data is None or data.get("success") is False:
+        return None
+    return data.get("totalResults")
+
+
+async def discover_year_partitions(
+    client: httpx.AsyncClient, api_key: str, semaphore: asyncio.Semaphore
+) -> dict[str, int]:
+    """Count items per publication year, and verify the years account for the whole corpus.
+
+    A filter that silently matches everything (or nothing) would otherwise produce a
+    plausible-looking but wrong dataset, so the sum is checked against totalResults
+    before a single item is harvested.
+    """
+    # Counted with ISSUED_PRESENT (not the bare query): the year partitions can only
+    # ever cover date-bearing items, so that is the total they must reconcile against.
+    total = await count_results(client, api_key, [ISSUED_PRESENT])
+    if total is None:
+        raise click.ClickException("items: could not count the corpus; check the API key")
+
+    years = list(range(YEAR_MIN, YEAR_MAX))
+    pbar = tqdm(desc="items: counting years", unit="year", total=len(years))
+
+    async def one(year: int) -> tuple[int, int | None]:
+        async with semaphore:
+            count = await count_results(client, api_key, [year_qf(year)])
+        pbar.update(1)
+        return year, count
+
+    try:
+        counted = await asyncio.gather(*(one(y) for y in years))
+    finally:
+        pbar.close()
+
+    if any(count is None for _, count in counted):
+        raise click.ClickException("items: some year counts failed; re-run to retry")
+
+    partitions = {str(year): count for year, count in counted if count}
+    covered = sum(partitions.values())
+    if covered != total:
+        raise click.ClickException(
+            f"items: year partitions cover {covered} items but the corpus has {total}. "
+            f"Widen YEAR_MIN/YEAR_MAX ({YEAR_MIN}-{YEAR_MAX}) to cover every publication year."
+        )
+    click.echo(
+        f"items: {total} items across {len(partitions)} year partitions "
+        f"({min(partitions, key=int)}-{max(partitions, key=int)}), counts verified"
+    )
+    return partitions
+
+
+async def harvest_year(
     client: httpx.AsyncClient,
     api_key: str,
-    state: dict,
-    cursor_key: str,
-    requests_key: str,
-    done_key: str,
-    total_key: str,
-    extra_params: dict,
-    on_response,
-    on_flush,
-    desc: str,
+    year: int,
+    st: dict,
     output_dir: Path,
+    parts_dir: Path,
     ckpt: dict,
+    pbar: tqdm,
+    semaphore: asyncio.Semaphore,
 ) -> None:
-    """Drive one cursor-paginated Search API loop with periodic flush/checkpoint."""
+    """Drive one year's cursor chain. Chains are independent, so they run concurrently."""
+    pstate = st["partitions"][str(year)]
+    if pstate["done"]:
+        return
+
     max_requests = int(os.environ.get(MAX_REQUESTS_ENV, "0") or 0)
-    cursor = state[cursor_key]
-    total = state.get(total_key)
-    pbar = tqdm(
-        desc=desc,
-        unit="req",
-        initial=state[requests_key],
-        total=math.ceil(total / 100) if total else None,
-    )
+    item_rows: list[dict] = []
+    enrich_rows: list[dict] = []
+    hint_rows: list[tuple[str, str]] = []
+
+    def flush(next_cursor: str | None) -> None:
+        if item_rows:
+            stem = f"{year}_{pstate['part']:05d}"
+            write_part(parts_dir / f"items_{stem}.parquet", item_rows, ITEMS_SCHEMA)
+            write_part(parts_dir / f"enrich_{stem}.parquet", enrich_rows, ENRICHMENTS_SCHEMA)
+            pstate["part"] += 1
+            item_rows.clear()
+            enrich_rows.clear()
+        if hint_rows:
+            append_lines(
+                parts_dir / "thirdparty_labels.jsonl",
+                [json.dumps({"uri": u, "label": l}, ensure_ascii=False) for u, l in hint_rows],
+            )
+            hint_rows.clear()
+        pstate["cursor"] = next_cursor
+        save_checkpoint(output_dir, ckpt)
+
+    cursor = pstate["cursor"]
     requests_since_flush = 0
-    try:
-        while cursor:
-            params = dict(SEARCH_PARAMS)
-            params.update(extra_params)
-            params["cursor"] = cursor
+    while cursor:
+        params = dict(SEARCH_PARAMS)
+        params["qf"] = SEARCH_PARAMS["qf"] + [year_qf(year)]
+        params["cursor"] = cursor
+        async with semaphore:
             data = await fetch_json(
                 client,
                 FULLTEXT_SEARCH_API,
                 params=params,
                 headers={"x-api-key": api_key},
                 phase="items",
-                record_id=f"{desc} request #{state[requests_key]}",
+                record_id=f"year {year} request #{pstate['requests']}",
             )
-            if data is None or data.get("success") is False:
-                # Cursor chains cannot skip a page; flush progress and abort.
-                on_flush(cursor)
-                save_checkpoint(output_dir, ckpt)
-                raise click.ClickException(
-                    f"{desc}: Search API request failed after retries; re-run to resume"
-                )
-            if state.get(total_key) is None and data.get("totalResults") is not None:
-                state[total_key] = data["totalResults"]
-                pbar.total = math.ceil(data["totalResults"] / 100)
-            on_response(data.get("items") or [])
-            state[requests_key] += 1
-            requests_since_flush += 1
-            pbar.update(1)
-            cursor = data.get("nextCursor")
-            if requests_since_flush >= ITEMS_FLUSH_EVERY:
-                on_flush(cursor)
-                save_checkpoint(output_dir, ckpt)
-                requests_since_flush = 0
-            if max_requests and state[requests_key] >= max_requests:
-                tqdm.write(f"{desc}: stopping early at {MAX_REQUESTS_ENV}={max_requests}")
-                cursor = None
-        state[done_key] = True
-        on_flush(None)
-        save_checkpoint(output_dir, ckpt)
-    finally:
-        pbar.close()
+        if data is None or data.get("success") is False:
+            # A cursor chain cannot skip a page; save progress and abort the run.
+            flush(cursor)
+            raise click.ClickException(
+                f"items: year {year} failed after retries; re-run to resume"
+            )
+        for item in data.get("items") or []:
+            if not is_newspaper_dataset(first_or_none(item.get("edmDatasetName", []))):
+                st["skipped_non_newspaper"] += 1
+                continue
+            try:
+                row, edge_rows, hints = extract_item(item, year)
+            except Exception as exc:
+                log_error("items", str(item.get("id")), f"{type(exc).__name__}: {exc}")
+                continue
+            item_rows.append(row)
+            enrich_rows.extend(edge_rows)
+            hint_rows.extend(hints)
+
+        pstate["requests"] += 1
+        requests_since_flush += 1
+        pbar.update(1)
+        cursor = data.get("nextCursor")
+        if requests_since_flush >= ITEMS_FLUSH_EVERY:
+            flush(cursor)
+            requests_since_flush = 0
+        if max_requests and pstate["requests"] >= max_requests:
+            tqdm.write(f"items: year {year} stopping early at {MAX_REQUESTS_ENV}={max_requests}")
+            cursor = None
+
+    pstate["done"] = True
+    flush(None)
 
 
 async def phase_items(
@@ -520,11 +636,8 @@ async def phase_items(
     st = ckpt.setdefault(
         "items",
         {
-            "cursor": "*",
-            "requests": 0,
-            "part": 0,
+            "partitions": {},
             "done": False,
-            "total_results": None,
             "finalized": False,
             "skipped_non_newspaper": 0,
         },
@@ -533,49 +646,44 @@ async def phase_items(
         click.echo("items: already finalized, skipping (delete checkpoint.json to redo)")
         return
 
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+
     if not st["done"]:
-        item_rows: list[dict] = []
-        enrich_rows: list[dict] = []
-        hint_rows: list[tuple[str, str]] = []
+        if not st["partitions"]:
+            counts = await discover_year_partitions(client, api_key, semaphore)
+            st["partitions"] = {
+                year: {"count": count, "cursor": "*", "requests": 0, "part": 0, "done": False}
+                for year, count in counts.items()
+            }
+            save_checkpoint(output_dir, ckpt)
 
-        def on_response(items: list[dict]) -> None:
-            for item in items:
-                if not is_newspaper_dataset(first_or_none(item.get("edmDatasetName", []))):
-                    st["skipped_non_newspaper"] += 1
-                    continue
-                try:
-                    row, edge_rows, hints = extract_item(item)
-                except Exception as exc:
-                    log_error("items", str(item.get("id")), f"{type(exc).__name__}: {exc}")
-                    continue
-                item_rows.append(row)
-                enrich_rows.extend(edge_rows)
-                hint_rows.extend(hints)
+        max_partitions = int(os.environ.get(MAX_PARTITIONS_ENV, "0") or 0)
+        years = sorted(st["partitions"], key=int)
+        if max_partitions:
+            years = years[:max_partitions]
+            click.echo(f"items: limited to {len(years)} year partitions ({MAX_PARTITIONS_ENV})")
 
-        def on_flush(next_cursor: str | None) -> None:
-            if item_rows:
-                write_part(parts_dir / f"items_{st['part']:05d}.parquet", item_rows, ITEMS_SCHEMA)
-                write_part(
-                    parts_dir / f"enrich_{st['part']:05d}.parquet", enrich_rows, ENRICHMENTS_SCHEMA
-                )
-                st["part"] += 1
-                item_rows.clear()
-                enrich_rows.clear()
-            if hint_rows:
-                append_lines(
-                    parts_dir / "thirdparty_labels.jsonl",
-                    [
-                        json.dumps({"uri": u, "label": l}, ensure_ascii=False)
-                        for u, l in hint_rows
-                    ],
-                )
-                hint_rows.clear()
-            st["cursor"] = next_cursor
-
-        await search_cursor_loop(
-            client, api_key, st, "cursor", "requests", "done", "total_results",
-            {}, on_response, on_flush, "items: search pages", output_dir, ckpt,
+        expected = sum(
+            math.ceil(st["partitions"][y]["count"] / 100) for y in years
         )
+        done_requests = sum(st["partitions"][y]["requests"] for y in years)
+        pbar = tqdm(
+            desc="items: search pages", unit="req", total=expected, initial=done_requests
+        )
+        try:
+            await asyncio.gather(
+                *(
+                    harvest_year(
+                        client, api_key, int(y), st, output_dir, parts_dir, ckpt, pbar, semaphore
+                    )
+                    for y in years
+                )
+            )
+        finally:
+            pbar.close()
+
+        st["done"] = all(st["partitions"][y]["done"] for y in years)
+        save_checkpoint(output_dir, ckpt)
 
     finalize_items(output_dir, parts_dir, st)
     save_checkpoint(output_dir, ckpt)
