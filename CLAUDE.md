@@ -27,15 +27,15 @@ on re-run.
 
 ## Testing changes
 
-Never test against the full corpus (~10k requests). Two hidden env hooks scope a run
+Never test against the full corpus (~10k requests). Two testing flags scope a run
 down, and the HTTP cache makes repeat runs nearly instant:
 
 ```bash
 rm -rf data/output   # a finalized checkpoint makes phases skip themselves
-EOT_MAX_PARTITIONS=2 EOT_MAX_REQUESTS=2 ./build.py --sample-size 2
+./build.py --max-partitions 2 --max-requests 2 --sample-size 2
 ```
 
-`EOT_MAX_PARTITIONS` caps the number of year partitions; `EOT_MAX_REQUESTS` caps the
+`--max-partitions` caps the number of year partitions; `--max-requests` caps the
 cursor requests per partition. Test runs go in the real `data/output`, not a scratch dir.
 
 After a schema change, delete `data/output` before re-running — the merge step will
@@ -106,7 +106,7 @@ regardless of collection — that is how a 1989 photo from a crowdsourcing campa
 up in a newspaper query. And Europeana's own list of newspaper datasets includes names
 with no "Newspapers" in them (`18_RoL_ICCU_Foglio`, `15_*`, `92_*`), which our
 `Settings.newspaper_dataset_substring` filter would drop. It drops nothing today (the counter in
-`sample_metadata.json` is 0), but that counter is the tripwire: if it ever goes up,
+`metadata.json` is 0), but that counter is the tripwire: if it ever goes up,
 check the dropped names against the alias above before assuming the filter is right.
 
 **There is a real date field, `issued`** (`type="date"`, docValues), distinct from the
@@ -149,7 +149,7 @@ Search API does not return `dctermsIsPartOf`, so it was null for all 995k rows).
 column cannot be populated, delete it rather than shipping nulls.
 
 **Silent drops get counted.** Items skipped as non-newspaper are counted into
-`sample_metadata.json`; issues whose manifest has no canvases are written to
+`metadata.json`; issues whose manifest has no canvases are written to
 `errors.log`. Both used to vanish without trace. A number that jumps unexpectedly is the
 signal that a filter has started catching more than intended.
 

@@ -31,7 +31,7 @@ dependencies on first run, so there is no virtualenv or `pip install` step.
 
 Every issue has an exact publication date: `year_issued` (int) and `date_issued` (date).
 
-Alongside them: `sample_metadata.json` (counts, harvest date, endpoints used),
+Alongside them: `metadata.json` (counts, harvest date, endpoints used),
 `errors.log` (skipped records, one per line) and `checkpoint.json` (resume state).
 
 `pages.parquet` is sharded at ~1 GB — later shards are `pages_001.parquet`,
@@ -47,6 +47,8 @@ Alongside them: `sample_metadata.json` (counts, harvest date, endpoints used),
 --output-dir PATH                         [default: data/output]
 --cache-dir PATH                          [default: data/cache/http]
 --refresh-cache                           Clear the HTTP cache before starting
+--max-partitions INTEGER                  Testing: only the first N year partitions
+--max-requests INTEGER                    Testing: cap search requests per partition
 ```
 
 The three phases run in order and each depends on the last:

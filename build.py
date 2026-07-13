@@ -38,7 +38,9 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from enum import StrEnum
+from functools import cached_property
 from pathlib import Path
+from time import perf_counter
 from typing import Any, ClassVar
 from urllib.parse import urlsplit
 
@@ -46,12 +48,14 @@ import click
 import hishel
 import httpx
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from pyrate_limiter import Duration, limiter_factory
 from pyrate_limiter.extras.httpx_limiter import AsyncRateLimiterTransport
 from tenacity import (
     AsyncRetrying,
+    RetryCallState,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential_jitter,
@@ -72,6 +76,31 @@ class PhaseName(StrEnum):
 class SampleStrategy(StrEnum):
     PROPORTIONAL = "proportional"  # each dataset's share mirrors the corpus
     BALANCED = "balanced"  # every dataset gets an equal share
+
+
+class Fmt:
+    """Human-readable console formatting."""
+
+    @staticmethod
+    def count(n: int) -> str:
+        return f"{n:,}"
+
+    @staticmethod
+    def duration(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        minutes, secs = divmod(round(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m {secs:02d}s"
+
+    @staticmethod
+    def size(n_bytes: int) -> str:
+        size = float(n_bytes)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024:
+                return f"{size:,.0f} {unit}" if unit == "B" else f"{size:,.1f} {unit}"
+            size /= 1024
+        return f"{size:,.1f} TB"
 
 
 class RetryableStatus(Exception):
@@ -103,7 +132,9 @@ class RetryPolicy:
     jitter: float = 15.0  # uniform seconds added on top of each wait
     retryable_statuses: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
-    def retrying(self) -> AsyncRetrying:
+    def retrying(
+        self, before_sleep: Callable[[RetryCallState], None] | None = None
+    ) -> AsyncRetrying:
         """A fresh retry loop per request (instances are cheap, and sharing one
         across concurrent calls would share its iteration statistics).
 
@@ -119,6 +150,7 @@ class RetryPolicy:
                 initial=self.initial, max=self.cap, jitter=self.jitter
             ),
             stop=stop_after_attempt(self.attempts),
+            before_sleep=before_sleep,
             reraise=True,
         )
 
@@ -129,12 +161,6 @@ class Settings:
 
     Frozen, so no phase can mutate shared configuration mid-run.
     """
-
-    # Hidden testing hooks (not CLI flags): cap the requests per cursor chain
-    # and the number of year partitions, so the whole pipeline can be exercised
-    # on a small corpus.
-    MAX_REQUESTS_ENV: ClassVar[str] = "EOT_MAX_REQUESTS"
-    MAX_PARTITIONS_ENV: ClassVar[str] = "EOT_MAX_PARTITIONS"
 
     # The corpus is defined as date-bearing: every item must carry a
     # dcterms:issued date. This drops a single dateless record from ~995k, and
@@ -154,6 +180,8 @@ class Settings:
     sample_size: int
     sample_strategy: SampleStrategy
     rate_limit: int  # requests per second, across all APIs
+    max_partitions: int  # testing: harvest only the first N year partitions (0 = all)
+    max_requests: int  # testing: cap search requests per partition (0 = unlimited)
 
     # The Fulltext Search API, not record/v2/search.json. Only records ingested
     # into Europeana's Fulltext API are served here, and only those get IIIF
@@ -190,17 +218,11 @@ class Settings:
     pages_batch: int = 25  # harvested items per part/checkpoint flush
     pages_split_bytes: int = 1 << 30  # ~1 GB shards for pages.parquet
     retry: RetryPolicy = RetryPolicy()
-    max_partitions: int = 0  # 0 = unlimited; set via EOT_MAX_PARTITIONS
-    max_requests: int = 0  # 0 = unlimited; set via EOT_MAX_REQUESTS
 
     @classmethod
     def from_cli(cls, **cli: Any) -> "Settings":
-        return cls(
-            api_key=os.environ.get("EUROPEANA_API_KEY"),
-            max_partitions=int(os.environ.get(cls.MAX_PARTITIONS_ENV, "0") or 0),
-            max_requests=int(os.environ.get(cls.MAX_REQUESTS_ENV, "0") or 0),
-            **cli,
-        )
+        """CLI options plus the environment's API key."""
+        return cls(api_key=os.environ.get("EUROPEANA_API_KEY"), **cli)
 
     @property
     def parts_dir(self) -> Path:
@@ -303,22 +325,22 @@ class ErrorLog:
     """Append-only errors.log: every skipped record, one tab-separated line.
 
     Silent drops used to vanish without trace; the line count is published into
-    sample_metadata.json, and a number that jumps unexpectedly is the signal
-    that a filter has started catching more than intended.
+    metadata.json, and a number that jumps unexpectedly is the signal that a
+    filter has started catching more than intended.
     """
 
     def __init__(self, path: Path) -> None:
-        self._path = path
+        self.path = path
 
     def log(self, phase: str, record_id: str, message: str) -> None:
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        with self._path.open("a", encoding="utf-8") as fh:
+        with self.path.open("a", encoding="utf-8") as fh:
             fh.write(f"{stamp}\t{phase}\t{record_id}\t{message}\n")
 
     def count(self) -> int:
-        if not self._path.exists():
+        if not self.path.exists():
             return 0
-        with self._path.open(encoding="utf-8") as fh:
+        with self.path.open(encoding="utf-8") as fh:
             return sum(1 for _ in fh)
 
 
@@ -406,7 +428,7 @@ class Checkpoint:
 
 
 class MetadataFile:
-    """sample_metadata.json: harvest date, endpoints, per-phase counts, errors."""
+    """metadata.json: harvest date, endpoints, per-phase counts, skip count."""
 
     def __init__(self, path: Path, settings: Settings, errors: ErrorLog) -> None:
         self._path = path
@@ -428,7 +450,7 @@ class MetadataFile:
             "iiif_fulltext_api": "{annopage_url}?profile=text",
         }
         meta.setdefault("counts", {})[section] = counts
-        meta["errors_skipped"] = self._errors.count()
+        meta["records_skipped"] = self._errors.count()
         tmp = self._path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self._path)
@@ -635,8 +657,20 @@ class EuropeanaApi:
         record_id: str = "",
     ) -> dict | None:
         """GET a JSON resource with retries; log and return None on final failure."""
+        policy = self._settings.retry
+
+        def log_retry(retry_state: RetryCallState) -> None:
+            # A single flaky response is routine; surface real outages only.
+            if retry_state.attempt_number < 3:
+                return
+            exc = retry_state.outcome.exception() if retry_state.outcome else None
+            tqdm.write(
+                f"{phase or 'http'}: retry {retry_state.attempt_number}/{policy.attempts} "
+                f"for {record_id or url}: {type(exc).__name__}: {exc}"
+            )
+
         try:
-            return await self._settings.retry.retrying()(
+            return await policy.retrying(before_sleep=log_retry)(
                 self._get_json, url, params, headers
             )
         except NonRetryableStatus as exc:
@@ -646,7 +680,7 @@ class EuropeanaApi:
             self._errors.log(
                 phase,
                 record_id,
-                f"failed after {self._settings.retry.attempts} attempts for {url}: "
+                f"failed after {policy.attempts} attempts for {url}: "
                 f"{type(exc).__name__}: {exc}",
             )
             return None
@@ -666,32 +700,14 @@ class EuropeanaApi:
 
     # -- typed endpoints -------------------------------------------------------
 
-    async def count(self, extra_qf: Sequence[str]) -> int | None:
-        """totalResults for the base query plus extra qf filters (rows=0)."""
+    async def _search(
+        self, extra_qf: Sequence[str], *, rows: str | None, cursor: str, record_id: str
+    ) -> dict | None:
+        """One Fulltext Search request; a 200 with `"success": false` is a failure."""
         params = self._settings.base_search_params()
         params["qf"] += list(extra_qf)
-        params["rows"] = "0"
-        params["cursor"] = "*"
-        data = await self.fetch_json(
-            self._settings.fulltext_search_api,
-            params=params,
-            headers=self._auth,
-            phase="items",
-            record_id=" ".join(extra_qf) or "corpus",
-        )
-        if data is None or data.get("success") is False:
-            return None
-        return data.get("totalResults")
-
-    async def search_page(self, year: int, cursor: str, record_id: str) -> dict | None:
-        """One page of a year's cursor chain.
-
-        Only the year range is appended: qf values on the same field are ORed,
-        so pairing it with ISSUED_PRESENT would match the entire corpus. A 200
-        can still carry `"success": false`; that too is a failure.
-        """
-        params = self._settings.base_search_params()
-        params["qf"].append(self._settings.year_qf(year))
+        if rows is not None:
+            params["rows"] = rows
         params["cursor"] = cursor
         data = await self.fetch_json(
             self._settings.fulltext_search_api,
@@ -703,6 +719,23 @@ class EuropeanaApi:
         if data is None or data.get("success") is False:
             return None
         return data
+
+    async def count(self, extra_qf: Sequence[str]) -> int | None:
+        """totalResults for the base query plus extra qf filters (rows=0)."""
+        data = await self._search(
+            extra_qf, rows="0", cursor="*", record_id=" ".join(extra_qf) or "corpus"
+        )
+        return None if data is None else data.get("totalResults")
+
+    async def search_page(self, year: int, cursor: str, record_id: str) -> dict | None:
+        """One page of a year's cursor chain.
+
+        Only the year range is appended: qf values on the same field are ORed,
+        so pairing it with ISSUED_PRESENT would match the entire corpus.
+        """
+        return await self._search(
+            [self._settings.year_qf(year)], rows=None, cursor=cursor, record_id=record_id
+        )
 
     async def entity(self, etype: str, eid: str, uri: str) -> dict | None:
         return await self.fetch_json(
@@ -1284,7 +1317,11 @@ class Sampler:
 
 
 class Phase(ABC):
-    """One pipeline phase: shared wiring plus the worker/queue plumbing."""
+    """One pipeline phase: shared wiring plus the worker/queue plumbing.
+
+    `run()` is a template: skip if finalized, otherwise execute and report the
+    elapsed time -- so every phase greets, resumes and signs off the same way.
+    """
 
     name: ClassVar[str]
 
@@ -1304,8 +1341,23 @@ class Phase(ABC):
         self._errors = errors
         self._metadata = metadata
 
+    async def run(self) -> None:
+        if self._finalized:
+            self._echo("already finalized, skipping (delete checkpoint.json to redo)")
+            return
+        started = perf_counter()
+        await self._execute()
+        self._echo(f"done in {Fmt.duration(perf_counter() - started)}")
+
+    @property
     @abstractmethod
-    async def run(self) -> None: ...
+    def _finalized(self) -> bool: ...
+
+    @abstractmethod
+    async def _execute(self) -> None: ...
+
+    def _echo(self, message: str) -> None:
+        click.echo(f"{self.name}: {message}")
 
     async def _run_pipeline(
         self,
@@ -1383,20 +1435,25 @@ class ItemsPhase(Phase):
 
     name = "items"
 
-    def __init__(self, *args: Any) -> None:
-        super().__init__(*args)
-        self._extractor = ItemExtractor(self._settings, self._errors)
-        self._state = self._checkpoint.items
-        self._pbar: tqdm | None = None
-        self._issued = 0  # requests issued this run, shown as a bar postfix
+    _pbar: tqdm | None = None
+    _issued = 0  # requests issued this run, shown as a bar postfix
 
-    async def run(self) -> None:
-        if self._state.finalized:
-            click.echo("items: already finalized, skipping (delete checkpoint.json to redo)")
-            return
+    @property
+    def _state(self) -> ItemsState:
+        return self._checkpoint.items
+
+    @property
+    def _finalized(self) -> bool:
+        return self._state.finalized
+
+    @cached_property
+    def _extractor(self) -> ItemExtractor:
+        return ItemExtractor(self._settings, self._errors)
+
+    async def _execute(self) -> None:
         if not self._state.done:
             await self._harvest()
-        self._finalize()
+        self._merge_outputs()
         self._checkpoint.save()
 
     # -- harvesting -----------------------------------------------------------
@@ -1410,10 +1467,7 @@ class ItemsPhase(Phase):
         years = sorted(st.partitions, key=int)
         if self._settings.max_partitions:
             years = years[: self._settings.max_partitions]
-            click.echo(
-                f"items: limited to {len(years)} year partitions "
-                f"({Settings.MAX_PARTITIONS_ENV})"
-            )
+            self._echo(f"limited to {len(years)} year partitions (--max-partitions)")
 
         # Progress counts completed partitions, not requests: a resumed chain
         # replays every request since its last flushed cursor (from cache), so
@@ -1421,6 +1475,9 @@ class ItemsPhase(Phase):
         # creeps past its total -- at which point tqdm silently drops the bar.
         # Partitions only ever complete once.
         todo = [y for y in years if not st.partitions[y].done]
+        if len(todo) < len(years):
+            self._echo(f"resuming: {len(years) - len(todo)}/{len(years)} year partitions already done")
+        self._issued = 0
         self._pbar = tqdm(
             desc="items: year partitions",
             unit="year",
@@ -1481,8 +1538,8 @@ class ItemsPhase(Phase):
         covered = sum(counts.values())
         if covered != total:
             raise click.ClickException(
-                f"items: year partitions cover {covered} items but the corpus has "
-                f"{total}. Widen year_min/year_max "
+                f"items: year partitions cover {Fmt.count(covered)} items but the "
+                f"corpus has {Fmt.count(total)}. Widen year_min/year_max "
                 f"({self._settings.year_min}-{self._settings.year_max}) to cover "
                 f"every publication year."
             )
@@ -1491,8 +1548,8 @@ class ItemsPhase(Phase):
             for year, count in sorted(counts.items())
             if count
         }
-        click.echo(
-            f"items: {total} items across {len(partitions)} year partitions "
+        self._echo(
+            f"{Fmt.count(total)} items across {len(partitions)} year partitions "
             f"({min(partitions, key=int)}-{max(partitions, key=int)}), counts verified"
         )
         return partitions
@@ -1555,7 +1612,7 @@ class ItemsPhase(Phase):
             if self._settings.max_requests and requests >= self._settings.max_requests:
                 tqdm.write(
                     f"items: year {year} stopping early at "
-                    f"{Settings.MAX_REQUESTS_ENV}={self._settings.max_requests}"
+                    f"--max-requests={self._settings.max_requests}"
                 )
                 cursor = None
             if since_flush >= self._settings.items_flush_every:
@@ -1593,13 +1650,14 @@ class ItemsPhase(Phase):
         if msg.done:
             self._pbar.update(1)
 
-    # -- finalizing ------------------------------------------------------------
+    # -- merging ---------------------------------------------------------------
 
-    def _finalize(self) -> None:
+    def _merge_outputs(self) -> None:
         """Merge parts into items.parquet and enrichments.parquet, deduplicated.
 
-        Duplicates exist only where a crash replayed an unflushed window, so
-        edges are deduplicated only for items that were seen twice.
+        Duplicates exist only where a crash replayed an unflushed window.
+        Deduplication is a boolean mask over the item_id column, so entire
+        Arrow tables pass through without a per-row Python round-trip.
         """
         item_parts = self._store.parts("items_*.parquet")
         seen: set[str] = set()
@@ -1611,42 +1669,24 @@ class ItemsPhase(Phase):
             if not item_parts:
                 writer.write_table(pa.Table.from_pylist([], schema=Schemas.ITEMS))
             for part in tqdm(item_parts, desc="items: merging parts", unit="part"):
-                keep = []
-                for row in pq.read_table(part).to_pylist():
-                    iid = row["item_id"]
-                    if iid in seen:
+                table = pq.read_table(part)
+                mask = []
+                for iid in table["item_id"].to_pylist():
+                    fresh = iid not in seen
+                    if fresh:
+                        seen.add(iid)
+                    else:
                         dup_ids.add(iid)
-                        continue
-                    seen.add(iid)
-                    if row["data_provider"]:
-                        institutions.add(row["data_provider"])
-                    if row["dataset_name"]:
-                        datasets.add(row["dataset_name"])
-                    keep.append(row)
-                    n_items += 1
-                if keep:
-                    writer.write_table(pa.Table.from_pylist(keep, schema=Schemas.ITEMS))
+                    mask.append(fresh)
+                if not all(mask):
+                    table = table.filter(pa.array(mask))
+                if table.num_rows:
+                    institutions.update(pc.unique(table["data_provider"]).drop_null().to_pylist())
+                    datasets.update(pc.unique(table["dataset_name"]).drop_null().to_pylist())
+                    writer.write_table(table)
+                    n_items += table.num_rows
 
-        enrich_parts = self._store.parts("enrich_*.parquet")
-        dup_edges_seen: set[tuple] = set()
-        n_edges = 0
-        with self._store.open_output("enrichments.parquet", Schemas.ENRICHMENTS) as writer:
-            if not enrich_parts:
-                writer.write_table(pa.Table.from_pylist([], schema=Schemas.ENRICHMENTS))
-            for part in enrich_parts:
-                keep = []
-                for row in pq.read_table(part).to_pylist():
-                    if row["item_id"] in dup_ids:
-                        key = (row["item_id"], row["entity_uri"], row["source_property"])
-                        if key in dup_edges_seen:
-                            continue
-                        dup_edges_seen.add(key)
-                    keep.append(row)
-                    n_edges += 1
-                if keep:
-                    writer.write_table(
-                        pa.Table.from_pylist(keep, schema=Schemas.ENRICHMENTS)
-                    )
+        n_edges = self._merge_enrichments(dup_ids)
 
         self._state.finalized = True
         skipped = self._state.skipped_non_newspaper
@@ -1660,11 +1700,44 @@ class ItemsPhase(Phase):
                 "skipped_non_newspaper_datasets": skipped,
             },
         )
-        click.echo(
-            f"items: wrote {n_items} items ({len(institutions)} institutions, "
-            f"{len(datasets)} datasets, {n_edges} enrichment edges; "
+        self._echo(
+            f"wrote {Fmt.count(n_items)} items ({len(institutions)} institutions, "
+            f"{len(datasets)} datasets, {Fmt.count(n_edges)} enrichment edges; "
             f"{skipped} skipped as non-newspaper datasets)"
         )
+
+    def _merge_enrichments(self, dup_ids: set[str]) -> int:
+        """Merge edge parts; deduplicate only edges of items that were seen twice."""
+        enrich_parts = self._store.parts("enrich_*.parquet")
+        dup_array = pa.array(sorted(dup_ids)) if dup_ids else None
+        dup_edges_seen: set[tuple] = set()
+        n_edges = 0
+        with self._store.open_output("enrichments.parquet", Schemas.ENRICHMENTS) as writer:
+            if not enrich_parts:
+                writer.write_table(pa.Table.from_pylist([], schema=Schemas.ENRICHMENTS))
+            for part in enrich_parts:
+                table = pq.read_table(part)
+                if not table.num_rows:
+                    continue
+                has_dups = dup_array is not None and pc.any(
+                    pc.is_in(table["item_id"], value_set=dup_array)
+                ).as_py()
+                if not has_dups:  # the common case: pass the table straight through
+                    writer.write_table(table)
+                    n_edges += table.num_rows
+                    continue
+                keep = []
+                for row in table.to_pylist():
+                    if row["item_id"] in dup_ids:
+                        key = (row["item_id"], row["entity_uri"], row["source_property"])
+                        if key in dup_edges_seen:
+                            continue
+                        dup_edges_seen.add(key)
+                    keep.append(row)
+                if keep:
+                    writer.write_table(pa.Table.from_pylist(keep, schema=Schemas.ENRICHMENTS))
+                    n_edges += len(keep)
+        return n_edges
 
 
 @dataclass
@@ -1680,21 +1753,21 @@ class EntitiesPhase(Phase):
     name = "entities"
     DONE_LIST: ClassVar[str] = "entities_done.txt"
 
-    def __init__(self, *args: Any) -> None:
-        super().__init__(*args)
-        self._state = self._checkpoint.entities
-        self._pbar: tqdm | None = None
-        self._rows: list[dict] = []
-        self._done_uris: list[str] = []
+    _pbar: tqdm | None = None
 
-    async def run(self) -> None:
+    @property
+    def _state(self) -> EntitiesState:
+        return self._checkpoint.entities
+
+    @property
+    def _finalized(self) -> bool:
+        return self._state.finalized and self._state.post_done
+
+    async def _execute(self) -> None:
         enrichments_path = self._store.output_dir / "enrichments.parquet"
         items_path = self._store.output_dir / "items.parquet"
         if not enrichments_path.exists() or not items_path.exists():
             raise click.ClickException("entities: run the items phase first")
-        if self._state.finalized and self._state.post_done:
-            click.echo("entities: already finalized, skipping")
-            return
         if not self._state.finalized:
             await self._resolve(enrichments_path)
         if not self._state.post_done:
@@ -1708,6 +1781,10 @@ class EntitiesPhase(Phase):
         refs = self._resolvable_refs(enrichments_path)
         done = self._store.read_lines(self.DONE_LIST)
         todo = [ref for ref in refs if ref.uri not in done]
+        if len(todo) < len(refs):
+            self._echo(f"resuming: {len(refs) - len(todo)}/{len(refs)} entities already resolved")
+        self._rows: list[dict] = []
+        self._done_uris: list[str] = []
         self._pbar = tqdm(
             desc="entities", unit="entity", total=len(refs), initial=len(refs) - len(todo)
         )
@@ -1729,15 +1806,13 @@ class EntitiesPhase(Phase):
         self._metadata.update(
             "entities", {"resolvable_entities": len(refs), "entity_facts": n_facts}
         )
-        click.echo(f"entities: resolved {len(refs)} entities ({n_facts} facts)")
+        self._echo(f"resolved {len(refs)} entities ({Fmt.count(n_facts)} facts)")
 
     def _resolvable_refs(self, enrichments_path: Path) -> list[EntityRef]:
         uris = sorted(
-            set(
-                pq.read_table(enrichments_path, columns=["entity_uri"])[
-                    "entity_uri"
-                ].to_pylist()
-            )
+            pc.unique(
+                pq.read_table(enrichments_path, columns=["entity_uri"])["entity_uri"]
+            ).to_pylist()
         )
         refs: list[EntityRef] = []
         for uri in uris:
@@ -1779,7 +1854,65 @@ class EntitiesPhase(Phase):
     # -- postprocessing ----------------------------------------------------------
 
     def _postprocess_items(self, items_path: Path) -> None:
-        """Fill dc_*_en and enriched_* columns in items.parquet from entities."""
+        """Fill dc_*_en and enriched_* columns in items.parquet from entities.
+
+        Only the seven computed columns are built in Python; the other fifteen
+        pass through as Arrow arrays via set_column, untouched.
+        """
+        label_en, facts = self._entity_lookup()
+        edges = self._edges_by_item()
+
+        def enriched_json(item_edges: tuple, cls: str, extra: dict[str, str]) -> str | None:
+            objs = []
+            for uri, edge_cls, src in item_edges:
+                if edge_cls != cls:
+                    continue
+                obj = {"uri": uri, "label_en": label_en.get(uri), "source": src}
+                for out_key, fact_key in extra.items():
+                    obj[out_key] = facts.get(uri, {}).get(fact_key)
+                objs.append(obj)
+            return json.dumps(objs, ensure_ascii=False) if objs else None
+
+        def labels_for(item_edges: tuple, source: str) -> list[str]:
+            return [label_en[u] for u, _, s in item_edges if s == source and u in label_en]
+
+        n_rows = 0
+        with self._store.open_output("items.parquet", Schemas.ITEMS) as writer:
+            for batch in tqdm(
+                ParquetStore.iter_batches(items_path),
+                desc="entities: updating items.parquet",
+                unit="batch",
+            ):
+                columns: dict[str, list] = defaultdict(list)
+                for iid in batch["item_id"].to_pylist():
+                    item_edges = edges.get(iid, ())
+                    columns["dc_type_en"].append(labels_for(item_edges, "dc_type"))
+                    columns["dc_subject_en"].append(labels_for(item_edges, "dc_subject"))
+                    columns["dc_creator_en"].append(labels_for(item_edges, "dc_creator"))
+                    columns["enriched_concepts"].append(enriched_json(item_edges, "skos_Concept", {}))
+                    columns["enriched_agents"].append(enriched_json(item_edges, "edm_Agent", {}))
+                    columns["enriched_places"].append(
+                        enriched_json(item_edges, "edm_Place", {"lat": "lat", "lon": "lon"})
+                    )
+                    columns["enriched_timespans"].append(
+                        enriched_json(item_edges, "edm_TimeSpan", {"begin": "begin", "end": "end"})
+                    )
+                table = pa.Table.from_batches([batch])
+                for name, values in columns.items():
+                    field_ = Schemas.ITEMS.field(name)
+                    table = table.set_column(
+                        table.schema.get_field_index(name),
+                        field_,
+                        pa.array(values, type=field_.type),
+                    )
+                writer.write_table(table)
+                n_rows += table.num_rows
+            if n_rows == 0:
+                writer.write_table(pa.Table.from_pylist([], schema=Schemas.ITEMS))
+        self._echo(f"updated convenience columns on {Fmt.count(n_rows)} items")
+
+    def _entity_lookup(self) -> tuple[dict[str, str], dict[str, dict]]:
+        """English labels and location/time facts, keyed by entity URI."""
         label_en: dict[str, str] = {}
         facts: dict[str, dict] = defaultdict(dict)
         entities_path = self._store.output_dir / "entities.parquet"
@@ -1797,14 +1930,15 @@ class EntitiesPhase(Phase):
                         facts[uri].setdefault(
                             "lon" if field_name == "long" else field_name, value
                         )
-
         for hint in self._store.read_jsonl("thirdparty_labels.jsonl"):
             label_en.setdefault(hint["uri"], hint["label"])
+        return label_en, facts
 
-        # All enrichment edges keyed by item; strings are interned via a small
-        # cache so repeated URIs/classes share one object across 995k items.
+    def _edges_by_item(self) -> dict[str, tuple]:
+        """All enrichment edges keyed by item; strings interned via a small
+        cache so repeated URIs/classes share one object across 995k items."""
         intern: dict[str, str] = {}
-        edges: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+        edges: dict[str, list] = defaultdict(list)
         for batch in ParquetStore.iter_batches(self._store.output_dir / "enrichments.parquet"):
             for item_id, uri, cls, src in zip(
                 batch["item_id"].to_pylist(),
@@ -1819,48 +1953,7 @@ class EntitiesPhase(Phase):
                         intern.setdefault(src, src),
                     )
                 )
-
-        def enriched_json(item_edges: list, cls: str, extra: dict[str, str]) -> str | None:
-            objs = []
-            for uri, edge_cls, src in item_edges:
-                if edge_cls != cls:
-                    continue
-                obj = {"uri": uri, "label_en": label_en.get(uri), "source": src}
-                for out_key, fact_key in extra.items():
-                    obj[out_key] = facts.get(uri, {}).get(fact_key)
-                objs.append(obj)
-            return json.dumps(objs, ensure_ascii=False) if objs else None
-
-        def labels_for(item_edges: list, source: str) -> list[str]:
-            return [label_en[u] for u, _, s in item_edges if s == source and u in label_en]
-
-        n_rows = 0
-        with self._store.open_output("items.parquet", Schemas.ITEMS) as writer:
-            for batch in tqdm(
-                ParquetStore.iter_batches(items_path),
-                desc="entities: updating items.parquet",
-                unit="batch",
-            ):
-                rows = batch.to_pylist()
-                for row in rows:
-                    item_edges = edges.get(row["item_id"], [])
-                    row["dc_type_en"] = labels_for(item_edges, "dc_type")
-                    row["dc_subject_en"] = labels_for(item_edges, "dc_subject")
-                    row["dc_creator_en"] = labels_for(item_edges, "dc_creator")
-                    row["enriched_concepts"] = enriched_json(item_edges, "skos_Concept", {})
-                    row["enriched_agents"] = enriched_json(item_edges, "edm_Agent", {})
-                    row["enriched_places"] = enriched_json(
-                        item_edges, "edm_Place", {"lat": "lat", "lon": "lon"}
-                    )
-                    row["enriched_timespans"] = enriched_json(
-                        item_edges, "edm_TimeSpan", {"begin": "begin", "end": "end"}
-                    )
-                if rows:
-                    writer.write_table(pa.Table.from_pylist(rows, schema=Schemas.ITEMS))
-                    n_rows += len(rows)
-            if n_rows == 0:
-                writer.write_table(pa.Table.from_pylist([], schema=Schemas.ITEMS))
-        click.echo(f"entities: updated convenience columns on {n_rows} items")
+        return {iid: tuple(item_edges) for iid, item_edges in edges.items()}
 
 
 @dataclass
@@ -1881,24 +1974,31 @@ class PagesPhase(Phase):
     DONE_LIST: ClassVar[str] = "pages_done.txt"
     SAMPLE_FILE: ClassVar[str] = "pages_sample.json"
 
-    def __init__(self, *args: Any) -> None:
-        super().__init__(*args)
-        self._parser = PageParser(self._errors)
-        self._state = self._checkpoint.pages
-        self._pbar: tqdm | None = None
-        self._results: list[PagesResult] = []
+    _pbar: tqdm | None = None
 
-    async def run(self) -> None:
+    @property
+    def _state(self) -> PagesState:
+        return self._checkpoint.pages
+
+    @property
+    def _finalized(self) -> bool:
+        return self._state.finalized
+
+    @cached_property
+    def _parser(self) -> PageParser:
+        return PageParser(self._errors)
+
+    async def _execute(self) -> None:
         items_path = self._store.output_dir / "items.parquet"
         if not items_path.exists():
             raise click.ClickException("pages: run the items phase first")
-        if self._state.finalized:
-            click.echo("pages: already finalized, skipping")
-            return
 
         sample = self._load_or_build_sample(items_path)
         done = self._store.read_lines(self.DONE_LIST)
         todo = [entry for entry in sample if entry["item_id"] not in done]
+        if len(todo) < len(sample):
+            self._echo(f"resuming: {len(sample) - len(todo)}/{len(sample)} items already harvested")
+        self._results: list[PagesResult] = []
         self._pbar = tqdm(
             desc="pages", unit="item", total=len(sample), initial=len(sample) - len(todo)
         )
@@ -1931,8 +2031,8 @@ class PagesPhase(Phase):
                 "pages": n_pages,
             },
         )
-        click.echo(
-            f"pages: wrote {n_pages} pages from {n_items}/{len(sample)} sampled items"
+        self._echo(
+            f"wrote {Fmt.count(n_pages)} pages from {n_items}/{len(sample)} sampled items"
         )
 
     def _load_or_build_sample(self, items_path: Path) -> list[dict]:
@@ -1946,8 +2046,8 @@ class PagesPhase(Phase):
                 self._settings.sample_strategy,
             ):
                 return stored["sample"]
-        click.echo(
-            f"pages: building {self._settings.sample_strategy} sample of "
+        self._echo(
+            f"building {self._settings.sample_strategy} sample of "
             f"{self._settings.sample_size} items ..."
         )
         sample = Sampler(self._settings.sample_size, self._settings.sample_strategy).build(
@@ -2064,7 +2164,7 @@ class BuildPipeline:
         self.errors = ErrorLog(settings.output_dir / "errors.log")
         self.checkpoint = Checkpoint.load(settings.output_dir / "checkpoint.json")
         self.metadata = MetadataFile(
-            settings.output_dir / "sample_metadata.json", settings, self.errors
+            settings.output_dir / "metadata.json", settings, self.errors
         )
         self.store = ParquetStore(settings.output_dir, settings.parts_dir)
 
@@ -2074,12 +2174,22 @@ class BuildPipeline:
             PhaseName.ENTITIES: EntitiesPhase,
             PhaseName.PAGES: PagesPhase,
         }
+        started = perf_counter()
         async with EuropeanaApi(self.settings, self.errors) as api:
             for name in self.settings.phases:
                 phase = phase_types[name](
                     self.settings, api, self.checkpoint, self.store, self.errors, self.metadata
                 )
                 await phase.run()
+        self._print_summary(perf_counter() - started)
+
+    def _print_summary(self, elapsed: float) -> None:
+        click.echo(f"build finished in {Fmt.duration(elapsed)} -- {self.settings.output_dir}:")
+        for path in sorted(self.settings.output_dir.glob("*.parquet")):
+            click.echo(f"  {path.name:<24} {Fmt.size(path.stat().st_size):>10}")
+        skipped = self.errors.count()
+        if skipped:
+            click.echo(f"  {Fmt.count(skipped)} records skipped -> {self.errors.path}")
 
 
 @click.command()
@@ -2100,7 +2210,7 @@ class BuildPipeline:
 @click.option("--refresh-cache", is_flag=True, help="Clear the HTTP cache before starting")
 @click.option(
     "--phase",
-    type=click.Choice([*PhaseName, "all"]),
+    type=click.Choice([p.value for p in PhaseName] + ["all"]),
     default="all",
     show_default=True,
     help="Run a specific phase or all",
@@ -2114,8 +2224,8 @@ class BuildPipeline:
 )
 @click.option(
     "--sample-strategy",
-    type=click.Choice(list(SampleStrategy)),
-    default=SampleStrategy.PROPORTIONAL,
+    type=click.Choice([s.value for s in SampleStrategy]),
+    default=SampleStrategy.PROPORTIONAL.value,
     show_default=True,
     help=(
         "proportional: each dataset's share mirrors the corpus (representative); "
@@ -2129,6 +2239,18 @@ class BuildPipeline:
     show_default=True,
     help="Max requests per second sent to the Europeana APIs",
 )
+@click.option(
+    "--max-partitions",
+    type=click.IntRange(min=0),
+    default=0,
+    help="Testing: harvest only the first N year partitions (0 = all)",
+)
+@click.option(
+    "--max-requests",
+    type=click.IntRange(min=0),
+    default=0,
+    help="Testing: cap search requests per year partition (0 = unlimited)",
+)
 def main(
     output_dir: Path,
     cache_dir: Path,
@@ -2137,6 +2259,8 @@ def main(
     sample_size: int,
     sample_strategy: str,
     rate_limit: int,
+    max_partitions: int,
+    max_requests: int,
 ) -> None:
     """Harvest the Europeana Open Newspapers dataset into Parquet files."""
     load_dotenv()
@@ -2151,6 +2275,8 @@ def main(
         sample_size=sample_size,
         sample_strategy=SampleStrategy(sample_strategy),
         rate_limit=rate_limit,
+        max_partitions=max_partitions,
+        max_requests=max_requests,
     )
     if not settings.api_key and any(
         p in (PhaseName.ITEMS, PhaseName.ENTITIES) for p in settings.phases
