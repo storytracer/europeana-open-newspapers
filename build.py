@@ -5,6 +5,7 @@
 #     "click",
 #     "hishel<1",
 #     "httpx",
+#     "orjson",
 #     "pyarrow",
 #     "pyrate-limiter>=4",
 #     "python-dotenv",
@@ -27,7 +28,6 @@ owns all disk I/O (part files, done-lists, checkpoint saves).
 
 import asyncio
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -47,6 +47,7 @@ from urllib.parse import urlsplit
 import click
 import hishel
 import httpx
+import orjson
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -101,6 +102,30 @@ class Fmt:
                 return f"{size:,.0f} {unit}" if unit == "B" else f"{size:,.1f} {unit}"
             size /= 1024
         return f"{size:,.1f} TB"
+
+
+class Json:
+    """The one JSON codec of the build, backed by orjson.
+
+    orjson decodes the ~250 KB Search API payloads several times faster than
+    the stdlib (decoding dominates a cache replay) and always emits compact
+    UTF-8 -- the equivalent of ensure_ascii=False. Decode errors surface as
+    ValueError (orjson.JSONDecodeError subclasses it), so callers stay
+    codec-agnostic.
+    """
+
+    @staticmethod
+    def loads(data: bytes | str) -> Any:
+        return orjson.loads(data)
+
+    @staticmethod
+    def dumps(value: Any) -> str:
+        return orjson.dumps(value).decode()
+
+    @staticmethod
+    def dumps_indented(value: Any) -> str:
+        """2-space indent, for the human-facing state files."""
+        return orjson.dumps(value, option=orjson.OPT_INDENT_2).decode()
 
 
 class RetryableStatus(Exception):
@@ -412,7 +437,7 @@ class Checkpoint:
     def load(cls, path: Path) -> "Checkpoint":
         if not path.exists():
             return cls(path)
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = Json.loads(path.read_bytes())
         items_raw = raw.get("items", {})
         return cls(
             path,
@@ -436,7 +461,7 @@ class Checkpoint:
             "pages": asdict(self.pages),
         }
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.write_text(Json.dumps_indented(payload), encoding="utf-8")
         os.replace(tmp, self.path)
 
 
@@ -450,7 +475,7 @@ class MetadataFile:
 
     def update(self, section: str, counts: dict[str, int]) -> None:
         meta = (
-            json.loads(self._path.read_text(encoding="utf-8"))
+            Json.loads(self._path.read_bytes())
             if self._path.exists()
             else {}
         )
@@ -465,7 +490,7 @@ class MetadataFile:
         meta.setdefault("counts", {})[section] = counts
         meta["records_skipped"] = self._errors.count()
         tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(Json.dumps_indented(meta), encoding="utf-8")
         os.replace(tmp, self._path)
 
 
@@ -617,7 +642,7 @@ class ParquetStore:
                 fh.write(line + "\n")
 
     def append_jsonl(self, name: str, objs: Sequence[dict]) -> None:
-        self.append_lines(name, [json.dumps(o, ensure_ascii=False) for o in objs])
+        self.append_lines(name, [Json.dumps(o) for o in objs])
 
     def read_jsonl(self, name: str) -> Iterator[dict]:
         path = self.parts_dir / name
@@ -626,7 +651,7 @@ class ParquetStore:
         with path.open(encoding="utf-8") as fh:
             for line in fh:
                 if line.strip():
-                    yield json.loads(line)
+                    yield Json.loads(line)
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +745,7 @@ class EuropeanaApi:
         if resp.status_code != 200:
             raise NonRetryableStatus(f"HTTP {resp.status_code}")
         try:
-            return resp.json()
+            return Json.loads(resp.content)
         except ValueError as exc:
             raise InvalidJson(str(exc)) from exc
 
@@ -864,7 +889,7 @@ class TitleParser:
         """
         if not dc_title:
             return ""
-        text = " ".join(v for values in json.loads(dc_title).values() for v in values)
+        text = " ".join(v for values in Json.loads(dc_title).values() for v in values)
         text = cls.DATE_RE.sub("", text)
         text = cls.ISSUE_RE.sub("", text)
         return text.strip(" -–,;:") or ""
@@ -925,7 +950,7 @@ class ItemExtractor:
 
         row = {
             "item_id": item_uri,
-            "dc_title": json.dumps(titles, ensure_ascii=False),
+            "dc_title": Json.dumps(titles),
             "dc_description": self._dumps(item.get("dcDescriptionLangAware")),
             "dc_type": self._dumps(item.get("dcTypeLangAware")),
             "dc_type_en": None,
@@ -1035,7 +1060,7 @@ class ItemExtractor:
 
     @staticmethod
     def _dumps(value: Any) -> str | None:
-        return json.dumps(value, ensure_ascii=False) if value else None
+        return Json.dumps(value) if value else None
 
 
 class EntityParser:
@@ -1159,7 +1184,7 @@ class PageParser:
             "text": text,
             "language": data.get("language") or resource.get("language"),
             "text_rights": resource.get("edmRights") or data.get("edmRights"),
-            "annotations_json": json.dumps(annotations, ensure_ascii=False),
+            "annotations_json": Json.dumps(annotations),
             "page_id": self.annopage_id(url),
         }
 
@@ -1897,7 +1922,7 @@ class EntitiesPhase(Phase):
                 for out_key, fact_key in extra.items():
                     obj[out_key] = facts.get(uri, {}).get(fact_key)
                 objs.append(obj)
-            return json.dumps(objs, ensure_ascii=False) if objs else None
+            return Json.dumps(objs) if objs else None
 
         def labels_for(item_edges: tuple, source: str) -> list[str]:
             return [label_en[u] for u, _, s in item_edges if s == source and u in label_en]
@@ -2127,7 +2152,7 @@ class PagesPhase(Phase):
     def _load_or_build_sample(self, items_path: Path) -> list[dict]:
         path = self._store.parts_dir / self.SAMPLE_FILE
         if path.exists():
-            stored = json.loads(path.read_text(encoding="utf-8"))
+            stored = Json.loads(path.read_bytes())
             # Reuse the stored sample only if both knobs still match, otherwise
             # the run would resume against a sample that is not the one asked for.
             if (stored.get("sample_size"), stored.get("strategy")) == (
@@ -2143,7 +2168,7 @@ class PagesPhase(Phase):
             items_path
         )
         path.write_text(
-            json.dumps(
+            Json.dumps(
                 {
                     "sample_size": self._settings.sample_size,
                     "strategy": self._settings.sample_strategy,
@@ -2176,7 +2201,7 @@ class PagesPhase(Phase):
                     {
                         "item_id": entry["item_id"],
                         "manifest_url": entry["manifest_url"],
-                        "manifest": json.dumps(manifest, ensure_ascii=False),
+                        "manifest": Json.dumps(manifest),
                     }
                 )
 
