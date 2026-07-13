@@ -66,9 +66,16 @@ SEARCH_PARAMS = {
     "profile": "rich",
 }
 
+# The theme=newspaper query also returns a handful of records from collections that
+# are not newspaper collections at all (e.g. 135_Ag_EU_1989_Germany, a crowdsourced
+# 1989 photo archive whose items carry dc_type "Newspaper" but have no OCR). Every
+# genuine newspaper dataset has "Newspapers" in its edm_datasetName, so require it.
+NEWSPAPER_DATASET_SUBSTRING = "newspapers"
+
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 5
 CONCURRENCY = 8
+RATE_LIMIT = 5  # requests per second, across all APIs; override with --rate-limit
 ITEMS_FLUSH_EVERY = 200  # search requests per part-file flush
 ENTITY_CHUNK = 500
 PAGES_CHUNK = 25
@@ -246,9 +253,9 @@ def update_metadata(output_dir: Path, section: str, values: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_client(cache_dir: Path) -> httpx.AsyncClient:
+def make_client(cache_dir: Path, rate_limit: int) -> httpx.AsyncClient:
     limiter = limiter_factory.create_inmemory_limiter(
-        rate_per_duration=5, duration=Duration.SECOND
+        rate_per_duration=rate_limit, duration=Duration.SECOND
     )
     rate_limited = AsyncRateLimiterTransport(limiter=limiter)
     storage = hishel.AsyncFileStorage(base_path=cache_dir)  # ttl=None -> never expires
@@ -351,6 +358,10 @@ def first_or_none(values):
 def entity_class_for(uri: str, fallback: str) -> str:
     m = ENTITY_URI_RE.match(uri)
     return URI_TYPE_TO_CLASS[m.group(1)] if m else fallback
+
+
+def is_newspaper_dataset(dataset_name: str | None) -> bool:
+    return bool(dataset_name) and NEWSPAPER_DATASET_SUBSTRING in dataset_name.lower()
 
 
 def extract_item(item: dict) -> tuple[dict, list[dict], list[tuple[str, str]]]:
@@ -515,6 +526,7 @@ async def phase_items(
             "done": False,
             "total_results": None,
             "finalized": False,
+            "skipped_non_newspaper": 0,
         },
     )
     if st.get("finalized"):
@@ -528,6 +540,9 @@ async def phase_items(
 
         def on_response(items: list[dict]) -> None:
             for item in items:
+                if not is_newspaper_dataset(first_or_none(item.get("edmDatasetName", []))):
+                    st["skipped_non_newspaper"] += 1
+                    continue
                 try:
                     row, edge_rows, hints = extract_item(item)
                 except Exception as exc:
@@ -571,6 +586,7 @@ def finalize_items(output_dir: Path, parts_dir: Path, st: dict) -> None:
     seen: set[str] = set()
     dup_ids: set[str] = set()
     institutions: set[str] = set()
+    datasets: set[str] = set()
     n_items = 0
 
     tmp = output_dir / "items.parquet.tmp"
@@ -587,6 +603,8 @@ def finalize_items(output_dir: Path, parts_dir: Path, st: dict) -> None:
                 seen.add(iid)
                 if row["data_provider"]:
                     institutions.add(row["data_provider"])
+                if row["dataset_name"]:
+                    datasets.add(row["dataset_name"])
                 keep.append(row)
                 n_items += 1
             if keep:
@@ -616,18 +634,22 @@ def finalize_items(output_dir: Path, parts_dir: Path, st: dict) -> None:
     os.replace(tmp, output_dir / "enrichments.parquet")
 
     st["finalized"] = True
+    skipped = st.get("skipped_non_newspaper", 0)
     update_metadata(
         output_dir,
         "items",
         {
             "items": n_items,
             "institutions": len(institutions),
+            "datasets": len(datasets),
             "enrichment_edges": n_edges,
+            "skipped_non_newspaper_datasets": skipped,
         },
     )
     click.echo(
         f"items: wrote {n_items} items ({len(institutions)} institutions, "
-        f"{n_edges} enrichment edges)"
+        f"{len(datasets)} datasets, {n_edges} enrichment edges; "
+        f"{skipped} skipped as non-newspaper datasets)"
     )
 
 
@@ -881,22 +903,28 @@ def postprocess_items(output_dir: Path, parts_dir: Path) -> None:
 
 
 def build_sample(items_path: Path, max_items: int) -> list[dict]:
-    """Pick up to max_items per data_provider, round-robining across dc_type values."""
+    """Pick up to max_items per dataset, round-robining across dc_type values.
+
+    Grouped by dataset_name rather than data_provider: dataset_name is a controlled
+    identifier assigned at ingest, whereas data_provider is a free-text label with
+    spelling variants (the Austrian National Library appears under two names for a
+    single dataset, and grouping by provider would hand it a double quota).
+    """
     groups: dict[str, dict[str, list[tuple[str, str]]]] = defaultdict(lambda: defaultdict(list))
     for batch in iter_item_batches(
-        items_path, columns=["item_id", "data_provider", "dc_type", "manifest_url"]
+        items_path, columns=["item_id", "dataset_name", "dc_type", "manifest_url"]
     ):
-        for iid, provider, dc_type, manifest_url in zip(
+        for iid, dataset, dc_type, manifest_url in zip(
             batch["item_id"].to_pylist(),
-            batch["data_provider"].to_pylist(),
+            batch["dataset_name"].to_pylist(),
             batch["dc_type"].to_pylist(),
             batch["manifest_url"].to_pylist(),
         ):
-            groups[provider or ""][dc_type or ""].append((iid, manifest_url))
+            groups[dataset or ""][dc_type or ""].append((iid, manifest_url))
 
     sample: list[dict] = []
-    for provider in sorted(groups):
-        buckets = groups[provider]
+    for dataset in sorted(groups):
+        buckets = groups[dataset]
         keys = sorted(buckets)
         for key in keys:
             buckets[key].sort()
@@ -1152,9 +1180,10 @@ async def run_phases(
     cache_dir: Path,
     parts_dir: Path,
     max_items: int,
+    rate_limit: int,
 ) -> None:
     ckpt = load_checkpoint(output_dir)
-    async with make_client(cache_dir) as client:
+    async with make_client(cache_dir, rate_limit) as client:
         for phase in phases:
             if phase == "items":
                 await phase_items(client, api_key, output_dir, parts_dir, ckpt)
@@ -1192,9 +1221,23 @@ async def run_phases(
     type=int,
     default=100,
     show_default=True,
-    help="Max items per institution for the page sample",
+    help="Max items per dataset for the page sample",
 )
-def main(output_dir: Path, cache_dir: Path, refresh_cache: bool, phase: str, max_items: int):
+@click.option(
+    "--rate-limit",
+    type=click.IntRange(min=1),
+    default=RATE_LIMIT,
+    show_default=True,
+    help="Max requests per second sent to the Europeana APIs",
+)
+def main(
+    output_dir: Path,
+    cache_dir: Path,
+    refresh_cache: bool,
+    phase: str,
+    max_items: int,
+    rate_limit: int,
+):
     """Harvest the Europeana Open Newspapers dataset into Parquet files."""
     load_dotenv()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1214,7 +1257,9 @@ def main(output_dir: Path, cache_dir: Path, refresh_cache: bool, phase: str, max
             "EUROPEANA_API_KEY is not set (export it or add it to a .env file)"
         )
 
-    asyncio.run(run_phases(phases, api_key, output_dir, cache_dir, parts_dir, max_items))
+    asyncio.run(
+        run_phases(phases, api_key, output_dir, cache_dir, parts_dir, max_items, rate_limit)
+    )
 
 
 if __name__ == "__main__":
