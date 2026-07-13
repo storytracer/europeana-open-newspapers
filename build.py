@@ -23,7 +23,6 @@ Phases: items -> entities -> pages (all three run with --phase all).
 import asyncio
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -89,6 +88,8 @@ YEAR_MAX = 1950
 def year_qf(year: int) -> str:
     """Half-open range for one year: [Y TO Y+1}, so adjacent years cannot overlap."""
     return f"proxy_dcterms_issued:[{year} TO {year + 1}}}"
+
+
 
 # The theme=newspaper query also returns a handful of records from collections that
 # are not newspaper collections at all (e.g. 135_Ag_EU_1989_Germany, a crowdsourced
@@ -560,6 +561,7 @@ async def harvest_year(
     parts_dir: Path,
     ckpt: dict,
     pbar: tqdm,
+    issued: dict,
     semaphore: asyncio.Semaphore,
 ) -> None:
     """Drive one year's cursor chain. Chains are independent, so they run concurrently."""
@@ -586,10 +588,15 @@ async def harvest_year(
                 [json.dumps({"uri": u, "label": l}, ensure_ascii=False) for u, l in hint_rows],
             )
             hint_rows.clear()
+        # cursor and requests must be written together: they describe the same point in
+        # the chain. Advancing requests per-request would leave it ahead of the cursor
+        # after a crash, and the replayed requests would then be counted twice.
         pstate["cursor"] = next_cursor
+        pstate["requests"] = requests
         save_checkpoint(output_dir, ckpt)
 
     cursor = pstate["cursor"]
+    requests = pstate["requests"]
     requests_since_flush = 0
     while cursor:
         params = dict(SEARCH_PARAMS)
@@ -602,7 +609,7 @@ async def harvest_year(
                 params=params,
                 headers={"x-api-key": api_key},
                 phase="items",
-                record_id=f"year {year} request #{pstate['requests']}",
+                record_id=f"year {year} request #{requests}",
             )
         if data is None or data.get("success") is False:
             # A cursor chain cannot skip a page; save progress and abort the run.
@@ -623,19 +630,21 @@ async def harvest_year(
             enrich_rows.extend(edge_rows)
             hint_rows.extend(hints)
 
-        pstate["requests"] += 1
+        requests += 1
         requests_since_flush += 1
-        pbar.update(1)
+        issued["n"] += 1
+        pbar.set_postfix_str(f"{issued['n']} requests", refresh=False)
         cursor = data.get("nextCursor")
         if requests_since_flush >= ITEMS_FLUSH_EVERY:
             flush(cursor)
             requests_since_flush = 0
-        if max_requests and pstate["requests"] >= max_requests:
+        if max_requests and requests >= max_requests:
             tqdm.write(f"items: year {year} stopping early at {MAX_REQUESTS_ENV}={max_requests}")
             cursor = None
 
     pstate["done"] = True
     flush(None)
+    pbar.update(1)
 
 
 async def phase_items(
@@ -671,20 +680,24 @@ async def phase_items(
             years = years[:max_partitions]
             click.echo(f"items: limited to {len(years)} year partitions ({MAX_PARTITIONS_ENV})")
 
-        expected = sum(
-            math.ceil(st["partitions"][y]["count"] / 100) for y in years
-        )
-        done_requests = sum(st["partitions"][y]["requests"] for y in years)
+        # Progress counts completed partitions, not requests. A resumed chain restarts
+        # from its last flushed cursor and re-issues (from cache) every request since,
+        # so a per-request counter double-counts on every resume and creeps past its
+        # total -- at which point tqdm silently drops the bar. Partitions only ever
+        # complete once.
+        done_years = sum(1 for y in years if st["partitions"][y]["done"])
         pbar = tqdm(
-            desc="items: search pages", unit="req", total=expected, initial=done_requests
+            desc="items: year partitions", unit="year", total=len(years), initial=done_years
         )
+        issued = {"n": 0}  # requests issued this run, shown as a postfix
         try:
             # return_exceptions: one year hitting an API outage must not abandon the
             # other 300+ chains mid-flight. Failures are collected and reported below.
             results = await asyncio.gather(
                 *(
                     harvest_year(
-                        client, api_key, int(y), st, output_dir, parts_dir, ckpt, pbar, semaphore
+                        client, api_key, int(y), st, output_dir, parts_dir, ckpt,
+                        pbar, issued, semaphore,
                     )
                     for y in years
                 ),
