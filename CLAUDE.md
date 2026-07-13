@@ -9,6 +9,17 @@ One script, [build.py](build.py) — a self-contained `uv` script (dependencies 
 the PEP 723 header, not a lockfile). There is no test suite and no package layout. Run
 it with `./build.py`; the shebang handles dependencies.
 
+Internally the script is a set of classes: `Settings` (all tunables, frozen), `Schemas`
+(the four output Parquet schemas — the compatibility contract), `EuropeanaApi` (cached +
+rate-limited + retrying HTTP), `Checkpoint`/`ParquetStore`/`ErrorLog`/`MetadataFile`
+(state and I/O), pure parsers (`ItemExtractor`, `EntityParser`, `PageParser`,
+`TitleParser`, `EntityRef`), `Sampler`, and one `Phase` subclass per phase under a
+`BuildPipeline`. Every fan-out runs through the same worker/queue machinery
+(`Phase._run_pipeline`): jobs drain through a `WorkerPool`, handlers emit result
+messages into a bounded queue, and a single writer coroutine per phase owns all disk
+I/O — so part writes and checkpoint saves never interleave, and one failed job never
+cancels its siblings.
+
 Three phases, each depending on the last: **items → entities → pages**. Each writes
 part-files into `data/output/parts/` and merges them into the final Parquet at the end
 of the phase. Progress lives in `checkpoint.json`; a phase marked `finalized` is skipped
@@ -32,7 +43,7 @@ otherwise fail against part-files with the old schema. A rebuild is cheap: every
 is cached and never expires, so a full re-run replays from disk in a couple of minutes
 rather than re-hitting the API.
 
-`build_sample` is pure and reads only `items.parquet`, so sampling changes can be checked
+`Sampler` is pure and reads only `items.parquet`, so sampling changes can be checked
 against the real 995k-row corpus without any network at all — import it and inspect the
 distribution rather than running the pages phase.
 
@@ -69,9 +80,9 @@ check its `totalResults` against a known number.
   `nextCursor` even on the last populated page, so a chain terminates only after a
   further request that comes back empty: `ceil(count / 100) + 1`, not `ceil(count / 100)`.
 - **Europeana 502s under load, sometimes for minutes.** A cursor chain cannot skip a page,
-  so giving up costs the whole partition. `MAX_ATTEMPTS`/`BACKOFF_CAP` span ~4 minutes,
-  with jitter so that 300+ concurrent chains hit by the same outage do not retry in
-  lockstep and re-spike the server as it recovers.
+  so giving up costs the whole partition. `RetryPolicy` spans ~4 minutes of capped
+  exponential backoff, with jitter so that 300+ concurrent chains hit by the same outage
+  do not retry in lockstep and re-spike the server as it recovers.
 
 ## The index behind the API
 
@@ -94,7 +105,7 @@ Two things follow. The `proxy_dc_type` branch matches *any* item typed "Newspape
 regardless of collection — that is how a 1989 photo from a crowdsourcing campaign ends
 up in a newspaper query. And Europeana's own list of newspaper datasets includes names
 with no "Newspapers" in them (`18_RoL_ICCU_Foglio`, `15_*`, `92_*`), which our
-`NEWSPAPER_DATASET_SUBSTRING` filter would drop. It drops nothing today (the counter in
+`Settings.newspaper_dataset_substring` filter would drop. It drops nothing today (the counter in
 `sample_metadata.json` is 0), but that counter is the tripwire: if it ever goes up,
 check the dropped names against the alias above before assuming the filter is right.
 
@@ -111,22 +122,24 @@ concurrently. This is not just for speed: cursor pagination is inherently serial
 request needs the previous response's `nextCursor`), so a single chain is capped at
 ~1.3 req/s no matter what `--rate-limit` says. Partitioning makes the rate limit the
 binding constraint — and it is what gives each item its `year_issued`, which the API
-otherwise refuses to hand over. `discover_year_partitions` asserts the per-year counts
-sum to `totalResults` before harvesting starts; keep that assertion, it is the guard
-against the silent-mismatch failure mode above.
+otherwise refuses to hand over. `ItemsPhase._discover_partitions` asserts the per-year
+counts sum to `totalResults` before harvesting starts; keep that assertion, it is the
+guard against the silent-mismatch failure mode above.
 
-**Nothing is finalized until it is complete.** `finalize_items` sets `finalized`, and a
-finalized phase is skipped forever after. `phase_items` therefore refuses to finalize
-unless every partition reports `done`, and raises instead. Without that guard a partition
-that failed would merge the years that happened to succeed, declare the phase complete,
-and ship a dataset with entire decades missing — with no error anywhere.
+**Nothing is finalized until it is complete.** `ItemsPhase._finalize` sets `finalized`,
+and a finalized phase is skipped forever after. `ItemsPhase._harvest` therefore refuses
+to finalize unless every partition reports `done`, and raises instead. Without that
+guard a partition that failed would merge the years that happened to succeed, declare
+the phase complete, and ship a dataset with entire decades missing — with no error
+anywhere.
 
 **Progress counts partitions, not requests.** A resumed cursor chain restarts from its
 last flushed cursor and re-issues everything since (from cache), so a per-request counter
 double-counts on every resume and eventually creeps past its total — at which point tqdm
 silently drops the bar and renders exactly as if `total=None`. Partitions complete once.
-For the same reason `pstate["requests"]` is only written at flush, in lockstep with the
-cursor: advancing it per-request leaves it ahead of the cursor after a crash.
+For the same reason a partition's `requests` counter is only persisted at flush, in
+lockstep with the cursor (both travel in one `ItemsFlush` message and land in one atomic
+checkpoint save): advancing it per-request leaves it ahead of the cursor after a crash.
 
 **No all-null columns.** Four columns have been removed after turning out to be
 unfillable: `image_byte_size` (Europeana's IIIF image server derives JPEGs on the fly,
@@ -144,24 +157,24 @@ signal that a filter has started catching more than intended.
 (one per page; the IIIF annotation API has no batch form) and ~950 GB, of which 90% is
 the word-level `annotations` column, not the text.
 
-`build_sample` stratifies four levels deep, and each level exists because of a specific
-way the corpus is lopsided:
+`Sampler` stratifies four levels deep, and each level exists because of a specific way
+the corpus is lopsided:
 
 - **dataset** — keyed on `dataset_name`, not `data_provider`. `data_provider` is
   free-text with spelling variants (the Austrian National Library appears under two names
   for one dataset, and would draw a double quota); `dataset_name` comes from the ingest
-  pipeline. `--sample-strategy` picks proportional (`allocate`) or equal
-  (`allocate_equal`) shares across them.
+  pipeline. `--sample-strategy` picks proportional (`Sampler.allocate`) or equal
+  (`Sampler.allocate_equal`) shares across them.
 - **decade** — proportional within the dataset, with a floor of 1. Without the floor a
   proportional split rounds whole decades to zero; the 1820s are 3.7% of the corpus and
   were missing entirely from the old sample.
-- **title** — round-robin. `newspaper_title` has to strip both the trailing date *and*
-  issue numbering (`, nr: 16`), or Finland's 24k issues look like 3,572 separate
-  newspapers and the round-robin does nothing.
+- **title** — round-robin. `TitleParser.newspaper_title` has to strip both the trailing
+  date *and* issue numbering (`, nr: 16`), or Finland's 24k issues look like 3,572
+  separate newspapers and the round-robin does nothing.
 - **issue** — ordered by `md5(item_id)`. Item ids sort by title then date, so taking the
   first N returned 25 consecutive issues of a single newspaper. It must be md5 rather
   than `hash()`, which is salted per process and would make the sample unreproducible.
 
 The old strategy covered 20 of 34 decades with 47 titles; this one covers all 34 with
-~300. Verify a change by importing `build_sample` and comparing decade shares against the
+~300. Verify a change by importing `Sampler` and comparing decade shares against the
 corpus — not by eyeballing the sample size.
