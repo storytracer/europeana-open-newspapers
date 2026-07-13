@@ -1,7 +1,8 @@
 # CLAUDE.md
 
-Guidance for working in this repo. See [README.md](README.md) for what the dataset is
-and how to run the build.
+Guidance for working in this repo. [README.md](README.md) is the Hugging Face dataset
+card (frontmatter configs expect the Parquet files under `data/`); for the build CLI,
+see `./build.py --help`.
 
 ## Shape of the project
 
