@@ -12,6 +12,12 @@ language:
 - sr
 - pl
 - fr
+- ru
+- sv
+- it
+- en
+- es
+- he
 task_categories:
 - text-generation
 tags:
@@ -51,28 +57,137 @@ configs:
 
 # Europeana Open Newspapers
 
-Openly licensed historical newspapers with OCR full text, harvested from
-[Europeana](https://www.europeana.eu/)'s public APIs.
+**995,182 openly licensed historical newspaper issues (1618–1946)** from 11 European
+libraries, aggregated through [Europeana](https://www.europeana.eu/) — complete
+issue-level metadata for the whole corpus, semantic enrichment resolved to the
+[Europeana Entity Collection](https://europeana.atlassian.net/wiki/spaces/EF/pages/2324561923),
+and **full OCR page text with word-level bounding-box annotations for a stratified,
+deterministic sample of 1,000 issues (7,001 pages, ~98 million characters)**.
 
-The corpus is **995,182 newspaper issues** published between **1618 and 1946**,
-contributed by 12 European libraries across 11 collections. Every issue carries an open
-licence and OCR text that Europeana has ingested into its Fulltext API. This dataset
-contains the **complete issue-level metadata** for the corpus, entity enrichments, and
-**page-level OCR text with word-level annotations for a stratified sample of 1,000
-issues (6,973 pages)** — page text at full-corpus scale would be ~15.7 million pages
-and ~950 GB, so pages are sampled, deliberately and reproducibly.
+Every issue in the corpus has OCR text that Europeana has ingested into its Fulltext
+API — page text at full-corpus scale would be ~15.7 million pages and ~950 GB, which
+is why pages are sampled, deliberately and reproducibly: the same build always selects
+the same issues.
+
+> **Snapshot:** Harvested from Europeana's public APIs on 2026-07-13.
+
+## Files
+
+| File | Rows | Size | Description |
+|---|---|---|---|
+| `data/pages/*.parquet` (3 shards) | 7,001 | 733 MB | Page text + word-level annotations for the sampled issues |
+| `data/items.parquet` | 995,182 | 40 MB | One row per issue — the complete corpus metadata |
+| `data/enrichments.parquet` | 2,465,752 | 13 MB | Enrichment edges — which entity was linked via which property |
+| `data/entities.parquet` | 2,289 | 23 KB | Entity catalogue — labels, coordinates, date ranges |
+| `data/manifests.parquet` | 1,000 | 2 MB | Raw IIIF manifests of the sampled issues (provenance) |
+
+`items` is self-contained for corpus-level analysis; `pages` is self-contained for
+text work. The auxiliary tables add the linked-data graph and the IIIF provenance.
+
+## What this dataset contains
+
+- Full OCR text for 6,973 newspaper pages, with per-page language, rights statement
+  and image facts (URL, dimensions, MIME type)
+- Word-, line- and block-level annotations tying every text snippet to character
+  offsets and pixel bounding boxes on the page image
+- Complete issue-level metadata for all 995,182 issues: multilingual titles, exact
+  publication dates, collection, institution, rights
+- Europeana's semantic enrichment: concepts, agents, places and timespans resolved to
+  the Entity Collection, with English labels, coordinates and date ranges
+- The raw IIIF Presentation manifest of every sampled issue
+
+## What this dataset does NOT contain
+
+- **Page text for the full corpus.** Only the 1,000-issue sample carries text; the
+  other 994,182 issues are metadata-only (their text is retrievable via the
+  `manifest_url` column and Europeana's IIIF APIs, exactly as this build did).
+- **Image bytes.** Use the `image_url` column; images are served by Europeana's IIIF
+  image infrastructure.
+- **Corrected OCR.** The text is the libraries' OCR as ingested by Europeana, with all
+  its period-typical noise.
+
+## Dataset scope
+
+The corpus is defined against Europeana's
+[Fulltext Search API](https://europeana.atlassian.net/wiki/spaces/EF/pages/2385739812)
+— **not** the general `record/v2/search.json`. Only records whose OCR was ingested
+into Europeana's Fulltext API are served there, and only those have IIIF
+AnnotationPages, i.e. retrievable page text. (The general Search API's
+`text_fulltext=true` flag marks a different, largely disjoint set: records whose
+*media file* is text-searchable, whose OCR was never ingested.)
+
+### Selection filters
+
+**1. Newspapers only**
+
+```
+theme=newspaper
+```
+
+`theme` is a server-side alias (defined in Europeana's public
+[Solr configuration](https://github.com/europeana/search)) that expands to:
+
+```
+(proxy_dc_type:("http://data.europeana.eu/concept/18")
+ OR edm_datasetName:(*Ag_EU_TEL*Newspapers* OR 9200231* OR 2020128* OR 2020126*
+                     OR 15_* OR 92_* OR 124_RoL_BnF_Newspapers OR 18_RoL_ICCU_Foglio))
+NOT (foaf_organization:(...19 excluded organisations...))
+```
+
+The `proxy_dc_type` branch matches *any* item typed
+[concept/18 ("Newspaper")](http://data.europeana.eu/concept/18) regardless of
+collection — which is how, for example, a 1989 photograph from a crowdsourcing
+campaign can end up in a newspaper query. The build therefore additionally requires
+"Newspapers" in `edm:datasetName`. This drops **0 records** in the current corpus;
+the counter is kept in `metadata.json` as a tripwire.
+
+**2. Text records with open reuse rights**
+
+```
+qf=TYPE:TEXT
+reusability=open
+```
+
+**3. Date-bearing items only**
+
+```
+qf=proxy_dcterms_issued:[* TO *]
+```
+
+Every item must carry a `dcterms:issued` date. This drops exactly **one record** from
+the corpus, and in exchange the whole dataset is partitionable and filterable by year.
+
+### Result
+
+| Stage | Records |
+|---|---|
+| `theme=newspaper` + `TYPE:TEXT` + `reusability=open` (Fulltext Search API) | 995,183 |
+| … with a `dcterms:issued` date | 995,182 |
+| … skipped as non-newspaper collections | 0 |
+| Page sample: issues selected | 1,000 |
+| … with retrievable IIIF manifests | 1,000 |
+| … whose manifests contain canvases | 889 |
+| Pages harvested | 7,001 (6,973 with OCR text) |
+
+### Harvesting method
+
+Three public APIs, ~29,000 requests, all recorded in `metadata.json`:
+
+- **Fulltext Search API** — issue metadata via cursor pagination, partitioned into one
+  query per publication year (`proxy_dcterms_issued:[Y TO Y+1}`). The partitioning is
+  not just for speed: the publication date can be *filtered* but is never *returned*
+  by any API profile, so the harvest partition is what gives each item its
+  `year_issued`. Before harvesting, the per-year counts are verified to sum exactly
+  to the corpus total, so a silently mismatching filter fails loudly instead of
+  shipping a plausible-but-wrong dataset.
+- **Entity API** — resolves every `data.europeana.eu` concept/agent/place/timespan
+  URI the items link to.
+- **IIIF Presentation + Fulltext APIs** — manifests and per-page annotation pages for
+  the sampled issues.
 
 ## Dataset structure
 
-Five configurations, one per Parquet table. The default configuration is `pages`.
-
-| config | file(s) | one row per | rows |
-| --- | --- | --- | --- |
-| `pages` *(default)* | `data/pages/pages_00001.parquet` … (3 shards) | newspaper page | 6,973 |
-| `items` | `data/items.parquet` | newspaper issue | 995,182 |
-| `enrichments` | `data/enrichments.parquet` | item→entity edge | 2,465,752 |
-| `entities` | `data/entities.parquet` | entity fact | 2,289 |
-| `manifests` | `data/manifests.parquet` | sampled issue | 1,000 |
+Five configurations, one per Parquet table; the default is `pages`.
 
 ```python
 from datasets import load_dataset
@@ -87,16 +202,16 @@ items = load_dataset("storytracer/europeana-open-newspapers", "items", split="tr
 | --- | --- | --- |
 | `item_id` | string | Europeana item URI, joins to `items` |
 | `page_number` | int16 | 1-based position of the page within its issue |
-| `page_id` | string | identifier of the IIIF annotation page |
-| `language` | string | page text language (ISO 639-1) |
-| `text` | string | full OCR text of the page |
-| `annotations` | string | JSON array of block/line/word annotations (see below) |
+| `page_id` | string | identifier of the IIIF annotation page (null on OCR-less pages) |
+| `language` | string | page text language (ISO 639-1; null on OCR-less pages) |
+| `text` | string | full OCR text of the page — **null where the page has no OCR** |
+| `annotations` | string | JSON array of block/line/word annotations (see below; null on OCR-less pages) |
 | `image_url` | string | URL of the page image (IIIF Image API) |
 | `image_mime_type` | string | MIME type of the page image |
 | `image_width` | int32 | page image width in pixels |
 | `image_height` | int32 | page image height in pixels |
-| `text_length` | int32 | length of `text` in characters |
-| `text_rights` | string | rights statement URL for the OCR text of this page |
+| `text_length` | int32 | length of `text` in characters (null on OCR-less pages) |
+| `text_rights` | string | rights statement URL for the OCR text of this page (null on OCR-less pages) |
 
 Each element of `annotations` locates a snippet of the page text on the page image:
 
@@ -108,6 +223,12 @@ Each element of `annotations` locates a snippet of the page text on the page ima
 `granularity` is `block`, `line` or `word`; `char_start`/`char_end` are offsets into
 `text`; the bounding box is in pixels on the page image. Fields are null where the
 source annotation lacks them.
+
+**Every physical page of a sampled issue is a row, whether or not it has OCR**: 28 of
+the 7,001 pages carry no OCR text upstream and ship as *structural rows* — `text` and
+the other OCR-derived columns are null, while `page_number` and the image facts
+remain, so an issue's page sequence has no holes and the page images stay reachable
+(e.g. for running your own OCR). Filter on `text IS NOT NULL` if you only want text.
 
 ### `items` — issue metadata (full corpus)
 
@@ -133,9 +254,26 @@ source annotation lacks them.
 | `image_rights` | string | rights statement URL for the issue's images |
 | `theme` | string | always `newspaper` |
 
-Every issue has an exact publication date: `year_issued` comes from Europeana's date
-index (used to partition the harvest), `date_issued` is parsed from the issue title,
-which ends in the date in all 11 collections.
+The `dc_*` columns follow Europeana's LangMap convention — JSON objects keyed by
+language tag, values as arrays of strings:
+
+```json
+{"de": ["Lienzer Zeitung - 1941-11-15"]}
+```
+
+The `enriched_*` columns carry Europeana's semantic enrichment, resolved to English
+labels with the source property preserved:
+
+```json
+[{"uri": "http://data.europeana.eu/place/216254", "label_en": "Vienna",
+  "lat": "48.208199", "lon": "16.3719", "source": "dcterms_spatial"}]
+```
+
+**Every issue has an exact publication date**, obtained twice over: `year_issued`
+comes from Europeana's date index (via the harvest partition — the API never returns
+the date field itself), and `date_issued` is parsed from the issue title, which ends
+in the date in all 11 collections. The two agree for 995,181 of 995,182 issues; the
+single disagreement (across a New Year boundary) is kept as harvested.
 
 ### `enrichments` — item→entity edges (full corpus)
 
@@ -154,7 +292,10 @@ which ends in the date in all 11 collections.
 | `entity_class` | string | as above |
 | `field` | string | `prefLabel`, `altLabel`, `broader`, `narrower`, `sameAs`, `exactMatch`, `lat`, `long`, `begin`, `end`, `dateOfBirth`, `dateOfDeath` |
 | `value` | string | the fact value |
-| `language` | string | label language, null for non-label facts |
+| `language` | string | label language; null for non-label facts |
+
+The `sameAs`/`exactMatch` rows link Europeana entities to Wikidata, GeoNames, VIAF
+and other authority files.
 
 ### `manifests` — raw IIIF manifests (sample)
 
@@ -165,21 +306,73 @@ which ends in the date in all 11 collections.
 | `manifest` | string | the complete IIIF Presentation (v3) manifest as JSON |
 
 Included as provenance: the manifests are the exact source documents the `pages` rows
-were derived from.
+were derived from — including, for the 111 sampled issues without any pages, the
+canvasless manifests that explain their absence.
 
-## Languages
+## How the tables relate
 
-| language | issues | | country | issues |
-| --- | --- | --- | --- | --- |
-| German (de) | 509,821 | | Germany | 362,303 |
-| Dutch (nl) | 325,656 | | Netherlands | 325,656 |
-| Latvian (lv) | 68,661 | | Austria | 147,518 |
-| Estonian (et) | 28,128 | | Latvia | 68,661 |
-| Finnish (fi) | 24,196 | | Estonia | 28,128 |
-| Serbian (sr) | 22,273 | | Finland | 24,196 |
-| Polish (pl) | 15,130 | | Serbia | 22,273 |
-| French (fr) | 1,317 | | Poland | 15,130 |
-| | | | Luxembourg | 1,317 |
+```
+items.parquet                       One row per issue, complete corpus
+    │
+    │  item_id
+    │
+    ├── pages.parquet               Page text + annotations (sampled issues)
+    │
+    ├── manifests.parquet           Raw IIIF source of those pages
+    │
+    └── enrichments.parquet         Which entity was linked via which property
+            │
+            │  entity_uri
+            │
+            └── entities.parquet    Labels, hierarchies, authority links, coordinates
+```
+
+## Example queries
+
+All examples use [DuckDB](https://duckdb.org/) and query the hosted files directly.
+
+```sql
+-- Page text of the sample (skip the 28 structural rows)
+CREATE TABLE pages AS SELECT * EXCLUDE (annotations)
+FROM 'hf://datasets/storytracer/europeana-open-newspapers/data/pages/*.parquet'
+WHERE text IS NOT NULL;
+
+-- Issues per decade, whole corpus
+SELECT (year_issued // 10) * 10 AS decade, COUNT(*) AS issues
+FROM 'hf://datasets/storytracer/europeana-open-newspapers/data/items.parquet'
+GROUP BY decade ORDER BY decade;
+
+-- Front pages, joined to their issue metadata
+SELECT p.text, i.dc_title, i.date_issued, i.data_provider
+FROM pages p
+JOIN 'hf://datasets/storytracer/europeana-open-newspapers/data/items.parquet' i
+  ON p.item_id = i.item_id
+WHERE p.page_number = 1
+LIMIT 10;
+
+-- The most multilingual issues: pages whose language differs from the issue's
+SELECT p.item_id, i.language AS issue_lang, p.language AS page_lang
+FROM pages p
+JOIN 'hf://datasets/storytracer/europeana-open-newspapers/data/items.parquet' i
+  ON p.item_id = i.item_id
+WHERE p.language <> i.language;
+
+-- Entities: Wikidata links for the places items are enriched with
+SELECT DISTINCT e.entity_uri, e.value AS authority_uri
+FROM 'hf://datasets/storytracer/europeana-open-newspapers/data/entities.parquet' e
+WHERE e.entity_class = 'edm_Place' AND e.field = 'sameAs'
+  AND e.value LIKE '%wikidata%';
+```
+
+Word-level annotations are JSON per page; in Python:
+
+```python
+import json
+
+page = pages[0]
+words = [a for a in json.loads(page["annotations"]) if a["granularity"] == "word"]
+# each word: text, char_start/char_end into page["text"], bbox_* in image pixels
+```
 
 ## How the page sample was drawn
 
@@ -197,60 +390,165 @@ lopsided in three directions at once (a third of it is one Dutch collection, the
    deterministic. The same parameters always select the same issues.
 
 The result covers **all 34 decades (1610s–1940s), all 11 collections and ~320 distinct
-newspapers**. 889 of the 1,000 sampled issues have retrievable page text (6,973 pages);
-the remaining 111 have manifests but no OCR annotations upstream — every skipped record
-is accounted for in the build's error log.
+newspapers** — a coverage that holds even among the issues with page text:
 
-**Caveat for statistical use:** this is a *coverage* sample, not a probability sample.
-The decade floor and the title round-robin deliberately over-represent rare decades and
-small newspapers; corpus-level statistics computed from `pages` should be weighted
-accordingly (or computed on `items`, which is complete).
+| collection | corpus share | sampled | | collection | corpus share | sampled |
+|---|---|---|---|---|---|---|
+| Netherlands | 32.7% | 325 | | Estonia | 2.8% | 29 |
+| Austria (ONB) | 14.8% | 148 | | Finland | 2.4% | 25 |
+| Hamburg | 13.2% | 131 | | Belgrade | 2.2% | 23 |
+| Berlin | 11.7% | 117 | | Poland | 1.5% | 16 |
+| Tessmann | 11.5% | 115 | | Luxembourg | 0.1% | 2 |
+| Latvia | 6.9% | 69 | | | | |
 
-## Dataset creation
+889 of the 1,000 sampled issues have retrievable pages (7,001 rows, 6,973 of them
+with OCR text); the remaining 111 have IIIF manifests with **no canvases at all**, an
+upstream gap that is strongly concentrated in one collection — 104 of the 111 are
+Austrian National Library issues, mostly from the 1850s–1870s. Every skipped record
+is accounted for in the build's error log, and the canvasless manifests themselves
+are preserved in `manifests.parquet`.
 
-Harvested from three public Europeana APIs (2026-07-13):
+**Caveat for statistical use:** this is a *coverage* sample, not a probability
+sample. The decade floor and the title round-robin deliberately over-represent rare
+decades and small newspapers; corpus-level statistics computed from `pages` should be
+weighted accordingly (or computed on `items`, which is complete).
 
-- **Fulltext Search API** (`api.europeana.eu/fulltext/search.json`) — issue metadata,
-  restricted to `theme=newspaper`, `reusability=open`, `TYPE:TEXT`, date-bearing items.
-  Only records whose OCR was ingested into Europeana's Fulltext API are served here,
-  which is what makes page text retrievable.
-- **Entity API** — resolves the concept/agent/place/timespan URIs linked from items.
-- **IIIF Presentation & Fulltext APIs** — manifests and page-level annotation pages
-  for the sampled issues.
+## Dataset composition
 
-Items typed "Newspaper" that belong to non-newspaper collections (e.g. crowdsourcing
-campaigns) are excluded via the collection name; the harvest verifies per-year counts
-against the API's own totals before writing anything, so silent filter mismatches fail
-loudly rather than shipping a plausible-but-wrong dataset.
+### Collections
 
-The dataset is built by a single self-contained script (`build.py`, Python ≥ 3.11 with
-[uv](https://docs.astral.sh/uv/)): `./build.py --sample-size 1000` reproduces it
-end-to-end, including the identical sample. The harvest is checkpointed, resumable and
-HTTP-cached; `metadata.json` records the harvest date, endpoints and per-table counts.
+| collection (edm:datasetName) | institution | issues |
+|---|---|---|
+| `9200359_…_Newspapers_Netherlands` | National Library of the Netherlands | 325,656 |
+| `9200300_…_Newspapers_ONB` | Austrian National Library | 147,518 |
+| `9200338_…_Newspapers_HamburgLibrary` | State and University Library Hamburg | 131,076 |
+| `9200355_…_Newspapers_Berlin` | Berlin State Library | 116,456 |
+| `9200333_Newspapers_TessmannLibrary` | Teßmann Library (South Tyrol) | 114,771 |
+| `9200303_…_Newspapers_Latvia` | National Library of Latvia | 68,661 |
+| `9200356_…_Newspapers_Estonia` | National Library of Estonia | 28,128 |
+| `9200301_…_Newspapers_Finland` | National Library of Finland | 24,196 |
+| `9200339_…_Newspapers_Belgrade` | University of Belgrade | 22,273 |
+| `9200357_…_Newspapers_poland` | National Library of Poland | 15,130 |
+| `9200396_…_Newspapers_Luxembourg` | National Library of Luxembourg | 1,317 |
 
-## Licensing
+### Languages
 
-- **Metadata** (items, enrichments, entities): [CC0](https://creativecommons.org/publicdomain/zero/1.0/),
-  per Europeana's Data Exchange Agreement.
-- **Content** (page text and images): openly licensed, but the licence **varies per
-  item and per page**. The exact rights statement URL is carried on every record:
-  `image_rights` in `items`, `text_rights` in `pages`. All of them permit reuse
-  (`reusability=open`); attribution requirements are those of the contributing
-  institution (`data_provider`).
+| language | issues | | country | issues |
+| --- | --- | --- | --- | --- |
+| German (de) | 509,821 | | Germany | 362,303 |
+| Dutch (nl) | 325,656 | | Netherlands | 325,656 |
+| Latvian (lv) | 68,661 | | Austria | 147,518 |
+| Estonian (et) | 28,128 | | Latvia | 68,661 |
+| Finnish (fi) | 24,196 | | Estonia | 28,128 |
+| Serbian (sr) | 22,273 | | Finland | 24,196 |
+| Polish (pl) | 15,130 | | Serbia | 22,273 |
+| French (fr) | 1,317 | | Poland | 15,130 |
+| | | | Luxembourg | 1,317 |
+
+The table above is issue-level. Page-level text is more multilingual than the issue
+metadata suggests: the sampled pages additionally include Russian, Swedish, Italian,
+English, Spanish and Hebrew pages (multilingual papers in the Baltic, Finnish and
+Austrian collections), with each page's own language in the `language` column of
+`pages`.
+
+### Text volume
+
+The 6,973 text pages carry **~98 million characters** of OCR (median 12,538 per page)
+and ~1.9 GB of word-level annotations (uncompressed) — the annotations, not the text,
+are ~90% of the `pages` files' size.
+
+## From IIIF and EDM to Parquet: design decisions
+
+Choices made when flattening Europeana's APIs into tables, documented as a replicable
+pattern for further Europeana full-text datasets.
+
+### Two layers per enrichable field
+
+`items` carries the provider's literals (`dc_title`, `dc_type` as LangMaps) *and*
+Europeana's enrichment (`enriched_*`, `dc_*_en`) side by side, so the value the
+library wrote and the entity Europeana resolved it to are both visible in every row —
+and the edge-level provenance survives in `enrichments.parquet`.
+
+### The publication date is obtained twice, deliberately
+
+Europeana's API can *filter* on `proxy_dcterms_issued` but never *returns* it, on any
+profile. `year_issued` is therefore derived from the year-partitioned harvest itself,
+and `date_issued` is parsed from the issue titles (which end in the date in all 11
+collections). Two independent routes to the same fact, agreeing on 995,181 of 995,182
+issues, each verifiable against the other.
+
+### Collections are keyed on `dataset_name`, not `data_provider`
+
+`data_provider` is a free-text label with spelling variants — the Austrian National
+Library appears under two names ("Austrian National Library", 139,674 issues, and
+"Österreichische Nationalbibliothek - Austrian National Library", 7,844) for a single
+collection, and would draw a double quota in sampling. `edm:datasetName` comes from
+the ingest pipeline and is stable.
+
+### Pages without OCR are rows, not gaps
+
+A canvas without OCR still physically exists, and its image is still reachable. It
+ships as a structural row (null `text`, intact `page_number` and image facts) rather
+than a silent hole in the page sequence; `pages` − `pages_with_text` in
+`metadata.json` counts them.
+
+### Raw manifests ship alongside the derived tables
+
+`manifests.parquet` preserves the exact IIIF source of every sampled issue at zero
+additional harvest cost — the derivation from source to table is auditable row by
+row, including for the issues that yielded no pages.
+
+### Determinism over convenience
+
+Issue selection hashes item ids with md5 (not Python's salted `hash()`), strata are
+iterated in sorted order, and the API's per-year counts are reconciled against the
+corpus total before anything is written. The result: the dataset is exactly
+reproducible from the public APIs with the published build script.
+
+## Provenance and reproducibility
+
+The dataset is built by a single self-contained script (`build.py`, Python ≥ 3.11
+with [uv](https://docs.astral.sh/uv/)): one command reproduces it end-to-end,
+including the identical sample. The harvest is checkpointed, resumable and
+HTTP-cached; `data/metadata.json` records the harvest date, the exact endpoints and
+per-table counts, including the tripwire counters (`skipped_non_newspaper_datasets`,
+`pages` vs `pages_with_text`).
 
 ## Limitations
 
 - **OCR quality varies** with the age and condition of the source material and is not
-  manually corrected.
+  manually corrected. Treat as historical OCR, not ground truth.
+- **Page text is a sample** — 1,000 issues of 995,182. See the sampling caveat above;
+  `items` is complete.
+- **111 sampled issues have no pages** (canvasless IIIF manifests upstream, 104 of
+  them ONB, 1850s–1870s), and 28 pages ship without OCR text.
 - **Dates are as published by the libraries**: `date_issued` is parsed from the issue
-  title; exactly one issue in 995,182 disagrees with the date index (across a New Year
-  boundary) and is kept as harvested.
-- **Page text is a sample** — see the sampling caveat above. `items` is complete.
-- **Coverage reflects Europeana's ingest**, not European newspaper history: eight
-  languages and nine countries are represented, with German and Dutch dominant.
+  title; one issue in 995,182 disagrees with the date index and is kept as harvested.
+- **Coverage reflects Europeana's Fulltext API ingest**, not European newspaper
+  history: 14 page-level languages and 9 countries, with German and Dutch dominant.
+
+## Licensing
+
+- **Metadata** (items, enrichments, entities, manifests):
+  [CC0](https://creativecommons.org/publicdomain/zero/1.0/), per Europeana's Data
+  Exchange Agreement.
+- **Content** (page text and images): the harvest selects `reusability=open`
+  (CC0, Public Domain Mark, CC-BY, CC-BY-SA); in the current corpus, **every issue and
+  every page carries the
+  [Public Domain Mark](http://creativecommons.org/publicdomain/mark/1.0/)**. The
+  per-record statement is on every row regardless — `image_rights` in `items`,
+  `text_rights` in `pages` — so the licensing remains verifiable if the corpus
+  changes.
+
+When reusing content, credit the providing institution identified by `data_provider`.
 
 ## Acknowledgements
 
-The newspapers were digitised and openly licensed by the 12 contributing institutions
-(see `data_provider`), aggregated by [Europeana](https://www.europeana.eu/). Dataset
-compiled by Sebastian Majstorovic from Europeana's public APIs.
+The newspapers were digitised, OCRed and openly licensed by the contributing
+institutions: the National Library of the Netherlands, the Austrian National Library,
+the State and University Library Hamburg, the Berlin State Library, the Teßmann
+Library, the National Library of Latvia, the National Library of Estonia, the
+National Library of Finland, the University of Belgrade, the National Library of
+Poland and the National Library of Luxembourg — aggregated and enriched by
+[Europeana](https://www.europeana.eu/). Dataset compiled by Sebastian Majstorovic
+from Europeana's public APIs.

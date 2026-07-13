@@ -160,7 +160,9 @@ column cannot be populated, delete it rather than shipping nulls.
 **Silent drops get counted.** Items skipped as non-newspaper are counted into
 `metadata.json`; issues whose manifest has no canvases are written to
 `errors.log`. Both used to vanish without trace. A number that jumps unexpectedly is the
-signal that a filter has started catching more than intended.
+signal that a filter has started catching more than intended. Pages without OCR are
+not drops at all: every canvas ships as a row, with null `text` where no OCR exists,
+and `pages - pages_with_text` in `metadata.json` is their tripwire.
 
 **Pages is a sample, deliberately** — the full corpus is ~15.7M pages, ~16.7M requests
 (one per page; the IIIF annotation API has no batch form) and ~950 GB, of which 90% is

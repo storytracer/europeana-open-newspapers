@@ -1152,28 +1152,27 @@ class EntityParser:
 
 
 class PageParser:
-    """IIIF annotation-page JSON -> page text, rights and word annotations."""
+    """IIIF annotation-page JSON -> page text, rights and word annotations. Pure.
+
+    Returns None when the annotation page carries no page-level text (no
+    page-granularity annotation, or one without a text value) -- the caller
+    then emits a structural row, because the physical page still exists.
+    """
 
     CHAR_RE: ClassVar[re.Pattern] = re.compile(r"#char=(\d+),(\d+)")
     XYWH_RE: ClassVar[re.Pattern] = re.compile(r"#xywh=(\d+),(\d+),(\d+),(\d+)")
 
-    def __init__(self, errors: ErrorLog) -> None:
-        self._errors = errors
-
-    def parse(self, data: dict, url: str, item_id: str) -> dict | None:
+    @classmethod
+    def parse(cls, data: dict, url: str) -> dict | None:
         resources = data.get("resources") or []
         page_ann = next(
             (r for r in resources if r.get("textGranularity") == "page"), None
         )
         if page_ann is None:
-            self._errors.log("pages", item_id, f"no page-level annotation in {url}")
             return None
         resource = page_ann.get("resource") or {}
         text = resource.get("value")
         if text is None:
-            self._errors.log(
-                "pages", item_id, f"page-level annotation without text value in {url}"
-            )
             return None
 
         annotations = []
@@ -1182,10 +1181,10 @@ class PageParser:
             if granularity not in ("block", "line", "word"):
                 continue
             resource_id = (res.get("resource") or {}).get("@id") or ""
-            char_match = self.CHAR_RE.search(resource_id)
+            char_match = cls.CHAR_RE.search(resource_id)
             on = res.get("on")
             on0 = on[0] if isinstance(on, list) and on else (on if isinstance(on, str) else "")
-            bbox_match = self.XYWH_RE.search(on0 or "")
+            bbox_match = cls.XYWH_RE.search(on0 or "")
             char_start, char_end = (
                 (int(char_match.group(1)), int(char_match.group(2)))
                 if char_match
@@ -1208,7 +1207,7 @@ class PageParser:
             "language": data.get("language") or resource.get("language"),
             "text_rights": resource.get("edmRights") or data.get("edmRights"),
             "annotations_json": Json.dumps(annotations),
-            "page_id": self.annopage_id(url),
+            "page_id": cls.annopage_id(url),
         }
 
     @staticmethod
@@ -2038,11 +2037,11 @@ class PagesResult:
 
 @dataclass
 class PageRef:
-    """One canvas worth fetching: its annotation page plus the image facts
-    that come from the manifest rather than the annotation page."""
+    """One canvas of an issue: its annotation page (None when the canvas has
+    no OCR reference) plus the image facts that come from the manifest."""
 
     page_number: int
-    annopage_url: str
+    annopage_url: str | None
     image_url: str | None
     image_mime_type: str | None
     image_width: int | None
@@ -2069,9 +2068,14 @@ class PagesPhase(Phase):
     which 90% is the word-level annotations column, not the text.
 
     Two stages: all manifests first (~6% of the requests), which yields the
-    exact number of annotation pages to fetch -- so the page bar has a true
-    total and progresses smoothly -- then the pages themselves. The raw
-    manifests are persisted to manifests.parquet as provenance for the pages.
+    exact number of pages to fetch -- so the page bar has a true total and
+    progresses smoothly -- then the pages themselves. The raw manifests are
+    persisted to manifests.parquet as provenance for the pages.
+
+    Every canvas becomes a row. Pages without OCR (no annotation reference, or
+    an annotation page without page-level text) keep their image facts and a
+    null `text`, so an issue's physical page sequence has no silent holes and
+    the page images remain reachable for downstream OCR.
     """
 
     name = "pages"
@@ -2089,10 +2093,6 @@ class PagesPhase(Phase):
     @property
     def _finalized(self) -> bool:
         return self._state.finalized
-
-    @cached_property
-    def _parser(self) -> PageParser:
-        return PageParser(self._errors)
 
     async def _execute(self) -> None:
         items_path = self._store.data_dir / "items.parquet"
@@ -2130,6 +2130,7 @@ class PagesPhase(Phase):
             self._settings.pages_split_bytes,
             group_column="item_id",
         )
+        n_with_text = self._count_pages_with_text()
         n_manifests = self._merge_manifests()
         self._state.finalized = True
         self._checkpoint.save()
@@ -2140,12 +2141,22 @@ class PagesPhase(Phase):
                 "manifests": n_manifests,
                 "items_with_pages": n_items,
                 "pages": n_pages,
+                "pages_with_text": n_with_text,
             },
         )
         self._echo(
-            f"wrote {Fmt.count(n_pages)} pages from {n_items}/{len(sample)} sampled "
-            f"items ({n_manifests} manifests)"
+            f"wrote {Fmt.count(n_pages)} pages ({Fmt.count(n_with_text)} with text) "
+            f"from {n_items}/{len(sample)} sampled items ({n_manifests} manifests)"
         )
+
+    def _count_pages_with_text(self) -> int:
+        """Pages without OCR ship as structural rows with null text; this count
+        is the tripwire that used to be their errors.log lines."""
+        n_with_text = 0
+        for shard in sorted((self._store.data_dir / "pages").glob("*.parquet")):
+            for batch in ParquetStore.iter_batches(shard, columns=["text"]):
+                n_with_text += len(batch) - batch["text"].null_count
+        return n_with_text
 
     def _merge_manifests(self) -> int:
         """Merge manifest parts, deduplicated by item_id.
@@ -2272,11 +2283,6 @@ class PagesPhase(Phase):
             try:
                 annotation_refs = canvas.get("annotations") or []
                 annopage_url = annotation_refs[0].get("id") if annotation_refs else None
-                if not annopage_url:
-                    self._errors.log(
-                        "pages", item_id, f"canvas {page_number}: no annotations reference"
-                    )
-                    continue
                 body = {}
                 canvas_items = canvas.get("items") or []
                 if canvas_items:
@@ -2315,36 +2321,49 @@ class PagesPhase(Phase):
                     "pages", item.item_id,
                     f"canvas {ref.page_number}: {type(exc).__name__}: {exc}",
                 )
-                row = None
+                row = self._page_row(item.item_id, ref, None)
             self._pbar.update(1)
-            if row is not None:
-                rows.append(row)
+            rows.append(row)
         self._items_done += 1
         self._pbar.set_postfix_str(
             f"{self._items_done}/{self._items_total} items", refresh=False
         )
         await emit(PagesResult(item.item_id, rows))
 
-    async def _fetch_page(self, item_id: str, ref: PageRef) -> dict | None:
-        data = await self._api.annopage(ref.annopage_url, item_id)
-        if data is None:
-            return None
-        page = self._parser.parse(data, ref.annopage_url, item_id)
-        if page is None:
-            return None
+    async def _fetch_page(self, item_id: str, ref: PageRef) -> dict:
+        """A full row when the page has OCR text, a structural row otherwise.
+
+        A page without OCR still physically exists: it keeps its position and
+        image facts with a null text, rather than leaving a silent hole in the
+        issue's page sequence. Fetch failures also fall through to a structural
+        row -- they are already recorded in errors.log.
+        """
+        page = None
+        if ref.annopage_url is not None:
+            data = await self._api.annopage(ref.annopage_url, item_id)
+            if data is not None:
+                page = PageParser.parse(data, ref.annopage_url)
+        return self._page_row(item_id, ref, page)
+
+    @staticmethod
+    def _page_row(item_id: str, ref: PageRef, page: dict | None) -> dict:
+        if ref.annopage_url is not None:
+            page_id = page["page_id"] if page else PageParser.annopage_id(ref.annopage_url)
+        else:
+            page_id = None
         return {
             "item_id": item_id,
             "page_number": ref.page_number,
-            "page_id": page["page_id"],
-            "text": page["text"],
+            "page_id": page_id,
+            "text": page["text"] if page else None,
             "image_url": ref.image_url,
             "image_mime_type": ref.image_mime_type,
-            "annotations": page["annotations_json"],
-            "language": page["language"],
+            "annotations": page["annotations_json"] if page else None,
+            "language": page["language"] if page else None,
             "image_width": ref.image_width,
             "image_height": ref.image_height,
-            "text_length": len(page["text"]),
-            "text_rights": page["text_rights"],
+            "text_length": len(page["text"]) if page else None,
+            "text_rights": page["text_rights"] if page else None,
         }
 
     async def _write_result(self, msg: PagesResult) -> None:
