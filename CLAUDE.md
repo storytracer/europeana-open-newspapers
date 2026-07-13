@@ -21,14 +21,20 @@ down, and the HTTP cache makes repeat runs nearly instant:
 
 ```bash
 rm -rf data/output   # a finalized checkpoint makes phases skip themselves
-EOT_MAX_PARTITIONS=2 EOT_MAX_REQUESTS=2 ./build.py --max-items 2
+EOT_MAX_PARTITIONS=2 EOT_MAX_REQUESTS=2 ./build.py --sample-size 2
 ```
 
 `EOT_MAX_PARTITIONS` caps the number of year partitions; `EOT_MAX_REQUESTS` caps the
 cursor requests per partition. Test runs go in the real `data/output`, not a scratch dir.
 
 After a schema change, delete `data/output` before re-running — the merge step will
-otherwise fail against part-files with the old schema.
+otherwise fail against part-files with the old schema. A rebuild is cheap: every response
+is cached and never expires, so a full re-run replays from disk in a couple of minutes
+rather than re-hitting the API.
+
+`build_sample` is pure and reads only `items.parquet`, so sampling changes can be checked
+against the real 995k-row corpus without any network at all — import it and inspect the
+distribution rather than running the pages phase.
 
 ## Europeana API traps
 
@@ -59,6 +65,13 @@ check its `totalResults` against a known number.
 - **The Fulltext Search API is not `record/v2/search.json`.** Only records ingested into
   the Fulltext API are served here, and only those have IIIF AnnotationPages (i.e. page
   text). The Search API's `text_fulltext=true` flag is a different, largely disjoint set.
+- **A cursor chain needs one request more than the maths says.** The API returns a
+  `nextCursor` even on the last populated page, so a chain terminates only after a
+  further request that comes back empty: `ceil(count / 100) + 1`, not `ceil(count / 100)`.
+- **Europeana 502s under load, sometimes for minutes.** A cursor chain cannot skip a page,
+  so giving up costs the whole partition. `MAX_ATTEMPTS`/`BACKOFF_CAP` span ~4 minutes,
+  with jitter so that 300+ concurrent chains hit by the same outage do not retry in
+  lockstep and re-spike the server as it recovers.
 
 ## The index behind the API
 
@@ -102,18 +115,53 @@ otherwise refuses to hand over. `discover_year_partitions` asserts the per-year 
 sum to `totalResults` before harvesting starts; keep that assertion, it is the guard
 against the silent-mismatch failure mode above.
 
-**No all-null columns.** Three columns have been removed after turning out to be
+**Nothing is finalized until it is complete.** `finalize_items` sets `finalized`, and a
+finalized phase is skipped forever after. `phase_items` therefore refuses to finalize
+unless every partition reports `done`, and raises instead. Without that guard a partition
+that failed would merge the years that happened to succeed, declare the phase complete,
+and ship a dataset with entire decades missing — with no error anywhere.
+
+**Progress counts partitions, not requests.** A resumed cursor chain restarts from its
+last flushed cursor and re-issues everything since (from cache), so a per-request counter
+double-counts on every resume and eventually creeps past its total — at which point tqdm
+silently drops the bar and renders exactly as if `total=None`. Partitions complete once.
+For the same reason `pstate["requests"]` is only written at flush, in lockstep with the
+cursor: advancing it per-request leaves it ahead of the cursor after a crash.
+
+**No all-null columns.** Four columns have been removed after turning out to be
 unfillable: `image_byte_size` (Europeana's IIIF image server derives JPEGs on the fly,
 sends no `Content-Length` and ignores `Range`), `image_status` (with it, the probe phase
-that populated it went too), and `edm_year` (the field is never returned). If a column
-cannot be populated, delete it rather than shipping nulls.
+that populated it went too), `edm_year` (never returned), and `parent_id` (the Fulltext
+Search API does not return `dctermsIsPartOf`, so it was null for all 995k rows). If a
+column cannot be populated, delete it rather than shipping nulls.
 
 **Silent drops get counted.** Items skipped as non-newspaper are counted into
-`sample_metadata.json`, not just dropped. A number that jumps unexpectedly is the signal
-that a filter has started catching more than intended.
+`sample_metadata.json`; issues whose manifest has no canvases are written to
+`errors.log`. Both used to vanish without trace. A number that jumps unexpectedly is the
+signal that a filter has started catching more than intended.
 
-**Pages is a sample, deliberately.** Up to `--max-items` per *dataset* — grouped by
-`dataset_name`, not `data_provider`. `data_provider` is a free-text label with spelling
-variants (the Austrian National Library appears under two names for one dataset, and
-would get a double quota); `dataset_name` is a controlled identifier from the ingest
-pipeline.
+**Pages is a sample, deliberately** — the full corpus is ~15.7M pages, ~16.7M requests
+(one per page; the IIIF annotation API has no batch form) and ~950 GB, of which 90% is
+the word-level `annotations` column, not the text.
+
+`build_sample` stratifies four levels deep, and each level exists because of a specific
+way the corpus is lopsided:
+
+- **dataset** — keyed on `dataset_name`, not `data_provider`. `data_provider` is
+  free-text with spelling variants (the Austrian National Library appears under two names
+  for one dataset, and would draw a double quota); `dataset_name` comes from the ingest
+  pipeline. `--sample-strategy` picks proportional (`allocate`) or equal
+  (`allocate_equal`) shares across them.
+- **decade** — proportional within the dataset, with a floor of 1. Without the floor a
+  proportional split rounds whole decades to zero; the 1820s are 3.7% of the corpus and
+  were missing entirely from the old sample.
+- **title** — round-robin. `newspaper_title` has to strip both the trailing date *and*
+  issue numbering (`, nr: 16`), or Finland's 24k issues look like 3,572 separate
+  newspapers and the round-robin does nothing.
+- **issue** — ordered by `md5(item_id)`. Item ids sort by title then date, so taking the
+  first N returned 25 consecutive issues of a single newspaper. It must be md5 rather
+  than `hash()`, which is salted per process and would make the sample unreproducible.
+
+The old strategy covered 20 of 34 decades with 47 titles; this one covers all 34 with
+~300. Verify a change by importing `build_sample` and comparing decade shares against the
+corpus — not by eyeballing the sample size.
