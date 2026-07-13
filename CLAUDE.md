@@ -1,8 +1,9 @@
 # CLAUDE.md
 
-Guidance for working in this repo. [README.md](README.md) is the Hugging Face dataset
-card (frontmatter configs expect the Parquet files under `data/`); for the build CLI,
-see `./build.py --help`.
+Guidance for working in this repo. [README.md](README.md) documents the build;
+[dataset_card.md](dataset_card.md) is the Hugging Face dataset card, which the build
+copies to `output/dataset/README.md` so that `output/dataset/` mirrors the HF repo
+exactly (card + `data/`). For the build CLI, see `./build.py --help`.
 
 ## Shape of the project
 
@@ -21,10 +22,15 @@ messages into a bounded queue, and a single writer coroutine per phase owns all 
 I/O — so part writes and checkpoint saves never interleave, and one failed job never
 cancels its siblings.
 
-Three phases, each depending on the last: **items → entities → pages**. Each writes
-part-files into `data/output/parts/` and merges them into the final Parquet at the end
-of the phase. Progress lives in `checkpoint.json`; a phase marked `finalized` is skipped
-on re-run.
+Three phases, each depending on the last: **items → entities → pages**. The build tree
+(`--output-dir`, default `output/`) has a fixed layout: `dataset/` is the HF upload
+exactly as it appears on the Hub (`README.md` + `data/` with the Parquet tables), and
+`work/` holds build state (`checkpoint.json`, `errors.log`, `parts/` with part-files
+and done-lists). The HTTP cache lives outside the build tree (`cache/http`,
+`--cache-dir` overrides) and is shared by all builds, so a variant build replays from
+the same cache. Parts merge into the final Parquet at the end of each phase. A phase
+marked `finalized` in the checkpoint is skipped on re-run; deleting `output/` (or just
+`output/dataset/`) resets the build — leftover work state is cleared as stale.
 
 ## Testing changes
 
@@ -32,17 +38,19 @@ Never test against the full corpus (~10k requests). Two testing flags scope a ru
 down, and the HTTP cache makes repeat runs nearly instant:
 
 ```bash
-rm -rf data/output   # a finalized checkpoint makes phases skip themselves
+rm -rf output   # a finalized checkpoint makes phases skip themselves
 ./build.py --max-partitions 2 --max-requests 2 --sample-size 2
 ```
 
 `--max-partitions` caps the number of year partitions; `--max-requests` caps the
-cursor requests per partition. Test runs go in the real `data/output`, not a scratch dir.
+cursor requests per partition. Test runs go in the real `output/` — unless it holds a
+deliverable that must not be clobbered, in which case use `--output-dir <scratch>`
+(the shared cache is picked up automatically).
 
-After a schema change, delete `data/output` before re-running — the merge step will
-otherwise fail against part-files with the old schema. A rebuild is cheap: every response
-is cached and never expires, so a full re-run replays from disk in a couple of minutes
-rather than re-hitting the API.
+After a schema change, delete `output/` before re-running — the merge step will
+otherwise fail against part-files with the old schema. A rebuild is cheap: every
+response is cached and never expires, so a full re-run replays from disk in a few
+minutes rather than re-hitting the API.
 
 `Sampler` is pure and reads only `items.parquet`, so sampling changes can be checked
 against the real 995k-row corpus without any network at all — import it and inspect the

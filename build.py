@@ -199,8 +199,8 @@ class Settings:
     ISSUED_PRESENT: ClassVar[str] = "proxy_dcterms_issued:[* TO *]"
 
     api_key: str | None
-    output_dir: Path
-    cache_dir: Path
+    output_dir: Path  # the build tree; its inner layout is fixed (see properties)
+    cache_dir: Path  # HTTP cache; lives outside the build tree, shared across builds
     phases: tuple[PhaseName, ...]
     sample_size: int
     sample_strategy: SampleStrategy
@@ -249,11 +249,32 @@ class Settings:
     @classmethod
     def from_cli(cls, **cli: Any) -> "Settings":
         """CLI options plus the environment's API key."""
+        if cli.get("cache_dir") is None:
+            # Deliberately outside the output tree: the cache outlives any
+            # single build and is shared by variant builds by default.
+            cli["cache_dir"] = Path("cache") / "http"
         return cls(api_key=os.environ.get("EUROPEANA_API_KEY"), **cli)
 
     @property
+    def dataset_dir(self) -> Path:
+        """The Hugging Face upload, exactly as it appears on the Hub:
+        README.md (the dataset card) plus data/. Publish with
+        `hf upload <repo> output/dataset . --repo-type dataset`."""
+        return self.output_dir / "dataset"
+
+    @property
+    def data_dir(self) -> Path:
+        """The Parquet tables, at the paths the dataset card's configs use."""
+        return self.dataset_dir / "data"
+
+    @property
+    def work_dir(self) -> Path:
+        """Build state (checkpoint, error log, part files); never uploaded."""
+        return self.output_dir / "work"
+
+    @property
     def parts_dir(self) -> Path:
-        return self.output_dir / "parts"
+        return self.work_dir / "parts"
 
     def base_search_params(self) -> dict[str, Any]:
         """Base Fulltext Search query; callers append exactly one more qf."""
@@ -501,8 +522,8 @@ class ParquetStore:
     leaves a truncated final file behind.
     """
 
-    def __init__(self, output_dir: Path, parts_dir: Path) -> None:
-        self.output_dir = output_dir
+    def __init__(self, data_dir: Path, parts_dir: Path) -> None:
+        self.data_dir = data_dir
         self.parts_dir = parts_dir
 
     # -- part files ---------------------------------------------------------
@@ -518,7 +539,7 @@ class ParquetStore:
 
     @contextmanager
     def open_output(self, name: str, schema: pa.Schema) -> Iterator[pq.ParquetWriter]:
-        out = self.output_dir / name
+        out = self.data_dir / name
         tmp = out.with_suffix(".parquet.tmp")
         writer = pq.ParquetWriter(tmp, schema, compression="snappy")
         try:
@@ -553,15 +574,18 @@ class ParquetStore:
     ) -> tuple[int, int]:
         """Merge parts into shards of roughly `split_bytes` each.
 
-        Shards are named `{base}.parquet`, `{base}_001.parquet`, ... Rows whose
-        `group_column` value already appeared in an *earlier* part are dropped:
-        an interrupted run that lost its done-list append rewrites the whole
-        group into a later part, so keeping the first occurrence deduplicates
-        exactly the crash-replay window (repeats within one part are kept --
-        a group's rows always land in a single part). Returns (rows written,
-        distinct values of `group_column`).
+        Shards live in their own subdirectory and are numbered from one:
+        `{base}/{base}_00001.parquet`, `{base}/{base}_00002.parquet`, ... Rows
+        whose `group_column` value already appeared in an *earlier* part are
+        dropped: an interrupted run that lost its done-list append rewrites the
+        whole group into a later part, so keeping the first occurrence
+        deduplicates exactly the crash-replay window (repeats within one part
+        are kept -- a group's rows always land in a single part). Returns
+        (rows written, distinct values of `group_column`).
         """
         parts = self.parts(pattern)
+        shard_dir = self.data_dir / base
+        shard_dir.mkdir(exist_ok=True)
         seen: set[str] = set()
         n_rows = 0
         shard_index = 0
@@ -570,8 +594,7 @@ class ParquetStore:
         bytes_in_shard = 0
 
         def shard_path(index: int) -> Path:
-            name = f"{base}.parquet" if index == 0 else f"{base}_{index:03d}.parquet"
-            return self.output_dir / name
+            return shard_dir / f"{base}_{index + 1:05d}.parquet"
 
         def open_writer() -> None:
             nonlocal writer, tmp_path
@@ -1394,7 +1417,7 @@ class Phase(ABC):
 
     async def run(self) -> None:
         if self._finalized:
-            self._echo("already finalized, skipping (delete checkpoint.json to redo)")
+            self._echo("already finalized, skipping (delete the output dir to redo)")
             return
         started = perf_counter()
         await self._execute()
@@ -1815,8 +1838,8 @@ class EntitiesPhase(Phase):
         return self._state.finalized and self._state.post_done
 
     async def _execute(self) -> None:
-        enrichments_path = self._store.output_dir / "enrichments.parquet"
-        items_path = self._store.output_dir / "items.parquet"
+        enrichments_path = self._store.data_dir / "enrichments.parquet"
+        items_path = self._store.data_dir / "items.parquet"
         if not enrichments_path.exists() or not items_path.exists():
             raise click.ClickException("entities: run the items phase first")
         if not self._state.finalized:
@@ -1966,7 +1989,7 @@ class EntitiesPhase(Phase):
         """English labels and location/time facts, keyed by entity URI."""
         label_en: dict[str, str] = {}
         facts: dict[str, dict] = defaultdict(dict)
-        entities_path = self._store.output_dir / "entities.parquet"
+        entities_path = self._store.data_dir / "entities.parquet"
         if entities_path.exists():
             for batch in ParquetStore.iter_batches(entities_path):
                 for uri, field_name, value, lang in zip(
@@ -1990,7 +2013,7 @@ class EntitiesPhase(Phase):
         cache so repeated URIs/classes share one object across 995k items."""
         intern: dict[str, str] = {}
         edges: dict[str, list] = defaultdict(list)
-        for batch in ParquetStore.iter_batches(self._store.output_dir / "enrichments.parquet"):
+        for batch in ParquetStore.iter_batches(self._store.data_dir / "enrichments.parquet"):
             for item_id, uri, cls, src in zip(
                 batch["item_id"].to_pylist(),
                 batch["entity_uri"].to_pylist(),
@@ -2072,7 +2095,7 @@ class PagesPhase(Phase):
         return PageParser(self._errors)
 
     async def _execute(self) -> None:
-        items_path = self._store.output_dir / "items.parquet"
+        items_path = self._store.data_dir / "items.parquet"
         if not items_path.exists():
             raise click.ClickException("pages: run the items phase first")
 
@@ -2351,15 +2374,26 @@ class BuildPipeline:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        settings.output_dir.mkdir(parents=True, exist_ok=True)
-        settings.parts_dir.mkdir(exist_ok=True)
+        dataset_existed = settings.data_dir.is_dir()
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        settings.parts_dir.mkdir(parents=True, exist_ok=True)
         settings.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.errors = ErrorLog(settings.output_dir / "errors.log")
-        self.checkpoint = Checkpoint.load(settings.output_dir / "checkpoint.json")
+        checkpoint_path = settings.work_dir / "checkpoint.json"
+        # The work tree describes one specific dataset build. If the dataset is
+        # gone (rm -rf output/, the documented reset) or the checkpoint was
+        # deleted, resuming from leftover work state would skip phases against
+        # an empty dataset or poison the next merge -- start clean instead.
+        stale = not dataset_existed or not checkpoint_path.exists()
+        if stale and any(settings.work_dir.iterdir()):
+            shutil.rmtree(settings.work_dir)
+            settings.parts_dir.mkdir(parents=True)
+            click.echo("cleared stale build state in work/")
+        self.errors = ErrorLog(settings.work_dir / "errors.log")
+        self.checkpoint = Checkpoint.load(checkpoint_path)
         self.metadata = MetadataFile(
-            settings.output_dir / "metadata.json", settings, self.errors
+            settings.data_dir / "metadata.json", settings, self.errors
         )
-        self.store = ParquetStore(settings.output_dir, settings.parts_dir)
+        self.store = ParquetStore(settings.data_dir, settings.parts_dir)
 
     async def run(self) -> None:
         phase_types: dict[PhaseName, type[Phase]] = {
@@ -2374,12 +2408,20 @@ class BuildPipeline:
                     self.settings, api, self.checkpoint, self.store, self.errors, self.metadata
                 )
                 await phase.run()
+        self._publish_card()
         self._print_summary(perf_counter() - started)
 
+    def _publish_card(self) -> None:
+        """Copy the dataset card in, so dataset/ mirrors the HF repo exactly."""
+        card = Path(__file__).with_name("dataset_card.md")
+        if card.exists():
+            shutil.copyfile(card, self.settings.dataset_dir / "README.md")
+
     def _print_summary(self, elapsed: float) -> None:
-        click.echo(f"build finished in {Fmt.duration(elapsed)} -- {self.settings.output_dir}:")
-        for path in sorted(self.settings.output_dir.glob("*.parquet")):
-            click.echo(f"  {path.name:<24} {Fmt.size(path.stat().st_size):>10}")
+        click.echo(f"build finished in {Fmt.duration(elapsed)} -- {self.settings.dataset_dir}:")
+        for path in sorted(self.settings.data_dir.rglob("*.parquet")):
+            name = str(path.relative_to(self.settings.dataset_dir))
+            click.echo(f"  {name:<35} {Fmt.size(path.stat().st_size):>10}")
         skipped = self.errors.count()
         if skipped:
             click.echo(f"  {Fmt.count(skipped)} records skipped -> {self.errors.path}")
@@ -2389,16 +2431,18 @@ class BuildPipeline:
 @click.option(
     "--output-dir",
     type=click.Path(path_type=Path),
-    default=Path("data/output"),
+    default=Path("output"),
     show_default=True,
-    help="Output directory for Parquet files",
+    help=(
+        "Build tree; its layout is fixed: dataset/ (the HF upload, README.md "
+        "+ data/) and work/ (checkpoint, part files, error log)"
+    ),
 )
 @click.option(
     "--cache-dir",
     type=click.Path(path_type=Path),
-    default=Path("data/cache/http"),
-    show_default=True,
-    help="HTTP cache directory",
+    default=None,
+    help="HTTP cache directory; shared by all builds  [default: cache/http]",
 )
 @click.option("--refresh-cache", is_flag=True, help="Clear the HTTP cache before starting")
 @click.option(
@@ -2456,7 +2500,7 @@ class BuildPipeline:
 )
 def main(
     output_dir: Path,
-    cache_dir: Path,
+    cache_dir: Path | None,
     refresh_cache: bool,
     phase: str,
     sample_size: int,
@@ -2468,10 +2512,6 @@ def main(
 ) -> None:
     """Harvest the Europeana Open Newspapers dataset into Parquet files."""
     load_dotenv()
-    if refresh_cache and cache_dir.exists():
-        shutil.rmtree(cache_dir)
-        click.echo(f"cleared HTTP cache at {cache_dir}")
-
     settings = Settings.from_cli(
         output_dir=output_dir,
         cache_dir=cache_dir,
@@ -2483,6 +2523,9 @@ def main(
         max_partitions=max_partitions,
         max_requests=max_requests,
     )
+    if refresh_cache and settings.cache_dir.exists():
+        shutil.rmtree(settings.cache_dir)
+        click.echo(f"cleared HTTP cache at {settings.cache_dir}")
     if not settings.api_key and any(
         p in (PhaseName.ITEMS, PhaseName.ENTITIES) for p in settings.phases
     ):

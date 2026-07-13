@@ -219,4 +219,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-data/
+# build tree and shared HTTP cache
+output*/
+cache/
