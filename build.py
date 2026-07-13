@@ -17,9 +17,7 @@ Harvests openly licensed newspapers with OCR full text from Europeana's
 Fulltext Search, Entity and IIIF APIs and writes items.parquet, enrichments.parquet,
 entities.parquet and pages.parquet.
 
-Phases: items -> entities -> pages (all three run with --phase all);
-the probe phase (HEAD requests to image URLs) must be requested explicitly
-with --phase probe.
+Phases: items -> entities -> pages (all three run with --phase all).
 """
 
 import asyncio
@@ -74,7 +72,6 @@ CONCURRENCY = 8
 ITEMS_FLUSH_EVERY = 200  # search requests per part-file flush
 ENTITY_CHUNK = 500
 PAGES_CHUNK = 25
-PROBE_CHUNK = 200
 PAGES_SPLIT_BYTES = 1 << 30
 
 # Hidden testing hook: caps the number of cursor requests per Search API loop
@@ -134,8 +131,6 @@ PAGES_SCHEMA = pa.schema(
         ("image_height", pa.int32()),
         ("text_length", pa.int32()),
         ("text_rights", pa.string()),
-        ("image_byte_size", pa.int64()),
-        ("image_status", pa.int16()),
     ]
 )
 
@@ -257,7 +252,7 @@ def make_client(cache_dir: Path) -> httpx.AsyncClient:
     )
     rate_limited = AsyncRateLimiterTransport(limiter=limiter)
     storage = hishel.AsyncFileStorage(base_path=cache_dir)  # ttl=None -> never expires
-    controller = hishel.Controller(force_cache=True, cacheable_methods=["GET", "HEAD"])
+    controller = hishel.Controller(force_cache=True, cacheable_methods=["GET"])
     cached = hishel.AsyncCacheTransport(
         transport=rate_limited, controller=controller, storage=storage
     )
@@ -1026,21 +1021,11 @@ async def harvest_item_pages(
                     "image_height": canvas.get("height"),
                     "text_length": len(page["text"]),
                     "text_rights": page["text_rights"],
-                    "image_byte_size": None,
-                    "image_status": None,
                 }
             )
         except Exception as exc:
             log_error("pages", item_id, f"canvas {page_number}: {type(exc).__name__}: {exc}")
     return rows
-
-
-def pages_shard_paths(output_dir: Path) -> list[Path]:
-    shards = []
-    if (output_dir / "pages.parquet").exists():
-        shards.append(output_dir / "pages.parquet")
-    shards.extend(sorted(output_dir.glob("pages_[0-9][0-9][0-9].parquet")))
-    return shards
 
 
 def finalize_pages(output_dir: Path, parts_dir: Path) -> tuple[int, int]:
@@ -1156,111 +1141,6 @@ async def phase_pages(
 
 
 # ---------------------------------------------------------------------------
-# Phase: probe
-# ---------------------------------------------------------------------------
-
-
-async def probe_url(client: httpx.AsyncClient, url: str) -> tuple[str, int | None, int | None]:
-    last_status = None
-    for attempt in range(MAX_ATTEMPTS):
-        if attempt:
-            await asyncio.sleep(min(2**attempt, 30))
-        try:
-            resp = await client.head(url, follow_redirects=False)
-        except httpx.HTTPError:
-            continue
-        last_status = resp.status_code
-        if resp.status_code in RETRY_STATUSES:
-            continue
-        size = resp.headers.get("Content-Length")
-        return url, int(size) if size and size.isdigit() else None, resp.status_code
-    if last_status is None:
-        log_error("probe", url, f"HEAD failed after {MAX_ATTEMPTS} attempts")
-    return url, None, last_status
-
-
-async def phase_probe(
-    client: httpx.AsyncClient, output_dir: Path, parts_dir: Path, ckpt: dict
-) -> None:
-    shards = pages_shard_paths(output_dir)
-    if not shards:
-        raise click.ClickException("probe: run the pages phase first")
-
-    urls: set[str] = set()
-    for shard in shards:
-        for batch in iter_item_batches(shard, columns=["image_url"]):
-            urls.update(u for u in batch["image_url"].to_pylist() if u)
-
-    results_path = parts_dir / "probe_results.jsonl"
-    results: dict[str, tuple[int | None, int | None]] = {}
-    if results_path.exists():
-        with results_path.open(encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip():
-                    rec = json.loads(line)
-                    results[rec["url"]] = (rec["size"], rec["status"])
-
-    todo = sorted(u for u in urls if u not in results)
-    pbar = tqdm(desc="probe", unit="url", total=len(urls), initial=len(urls) - len(todo))
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-
-    async def one(url: str):
-        async with semaphore:
-            result = await probe_url(client, url)
-        pbar.update(1)
-        return result
-
-    try:
-        for chunk in chunks(todo, PROBE_CHUNK):
-            probed = await asyncio.gather(*(one(url) for url in chunk))
-            lines = []
-            for url, size, status in probed:
-                results[url] = (size, status)
-                lines.append(json.dumps({"url": url, "size": size, "status": status}))
-            append_lines(results_path, lines)
-    finally:
-        pbar.close()
-
-    n_pages = 0
-    n_unreachable = 0
-    for shard in shards:
-        tmp = shard.with_suffix(".parquet.tmp")
-        with pq.ParquetWriter(tmp, PAGES_SCHEMA, compression="snappy") as writer:
-            wrote = False
-            for batch in iter_item_batches(shard):
-                rows = batch.to_pylist()
-                for row in rows:
-                    size, status = results.get(row["image_url"], (None, None))
-                    row["image_byte_size"] = size
-                    row["image_status"] = status
-                    n_pages += 1
-                    if status != 200:
-                        n_unreachable += 1
-                if rows:
-                    writer.write_table(pa.Table.from_pylist(rows, schema=PAGES_SCHEMA))
-                    wrote = True
-            if not wrote:
-                writer.write_table(pa.Table.from_pylist([], schema=PAGES_SCHEMA))
-        os.replace(tmp, shard)
-
-    ckpt["probe"] = {"done": True}
-    save_checkpoint(output_dir, ckpt)
-    update_metadata(
-        output_dir,
-        "probe",
-        {
-            "probed_urls": len(urls),
-            "pages_probed": n_pages,
-            "pages_not_ok": n_unreachable,
-        },
-    )
-    click.echo(
-        f"probe: probed {len(urls)} image URLs across {n_pages} pages "
-        f"({n_unreachable} pages with status != 200)"
-    )
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1282,8 +1162,6 @@ async def run_phases(
                 await phase_entities(client, api_key, output_dir, parts_dir, ckpt)
             elif phase == "pages":
                 await phase_pages(client, output_dir, parts_dir, ckpt, max_items)
-            elif phase == "probe":
-                await phase_probe(client, output_dir, parts_dir, ckpt)
 
 
 @click.command()
@@ -1304,7 +1182,7 @@ async def run_phases(
 @click.option("--refresh-cache", is_flag=True, help="Clear the HTTP cache before starting")
 @click.option(
     "--phase",
-    type=click.Choice(["items", "entities", "pages", "probe", "all"]),
+    type=click.Choice(["items", "entities", "pages", "all"]),
     default="all",
     show_default=True,
     help="Run a specific phase or all",
@@ -1328,7 +1206,6 @@ def main(output_dir: Path, cache_dir: Path, refresh_cache: bool, phase: str, max
     cache_dir.mkdir(parents=True, exist_ok=True)
     setup_error_log(output_dir)
 
-    # --phase all runs items, entities and pages; probe must be explicit.
     phases = ["items", "entities", "pages"] if phase == "all" else [phase]
 
     api_key = os.environ.get("EUROPEANA_API_KEY")
