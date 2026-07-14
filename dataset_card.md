@@ -98,7 +98,7 @@ text work. The auxiliary tables add the linked-data graph and the IIIF provenanc
 
 - **Page text for the full corpus.** Only the 1,000-issue sample carries text; the
   other 994,182 issues are metadata-only. Their text is retrievable via the
-  `manifest_url` column, following steps 4–5 of the harvest recipe below.
+  `manifest_url` column, following requests 3–4 of the harvest recipe below.
 - **Image bytes.** Use the `image_url` column; images are served by Europeana's IIIF
   image infrastructure.
 - **Corrected OCR.** The text is the libraries' OCR as ingested by Europeana, with all
@@ -107,21 +107,17 @@ text work. The auxiliary tables add the linked-data graph and the IIIF provenanc
 ## Dataset scope
 
 The corpus is defined against Europeana's
-[Fulltext Search API](https://europeana.atlassian.net/wiki/spaces/EF/pages/2385739812):
-
-```
-https://api.europeana.eu/fulltext/search.json
-```
-
-— **not** the general `record/v2/search.json`. Only records whose OCR was ingested
-into Europeana's Fulltext API are served there, and only those have IIIF
-AnnotationPages, i.e. retrievable page text. (The general Search API's
-`text_fulltext=true` flag marks a different, largely disjoint set: records whose
-*media file* is text-searchable, whose OCR was never ingested.)
+[Fulltext Search API](https://europeana.atlassian.net/wiki/spaces/EF/pages/2385739812)
+(`https://api.europeana.eu/fulltext/search.json`) — **not** the general
+`record/v2/search.json`. Only records whose OCR was ingested into Europeana's
+Fulltext API are served there, and only those have IIIF AnnotationPages, i.e.
+retrievable page text. (The general Search API's `text_fulltext=true` flag marks a
+different, largely disjoint set: records whose *media file* is text-searchable,
+whose OCR was never ingested.)
 
 The selection filters are expressed below as API queries. The Search and Entity APIs
-require an [API key](https://pro.europeana.eu/page/get-api), sent as an `x-api-key`
-header; the IIIF APIs are open.
+require a free [API key](https://pro.europeana.eu/page/get-api), sent as an
+`x-api-key` header; the IIIF APIs are open.
 
 ### Selection filters
 
@@ -143,10 +139,8 @@ NOT (foaf_organization:(...19 excluded organisations...))
 
 The `proxy_dc_type` branch matches *any* item typed
 [concept/18 ("Newspaper")](http://data.europeana.eu/concept/18) regardless of
-collection — which is how, for example, a 1989 photograph from a crowdsourcing
-campaign can end up in a newspaper query. The build therefore additionally requires
-"Newspapers" in `edm:datasetName`. This drops **0 records** in the current corpus;
-the counter is kept in `metadata.json` as a tripwire.
+collection, so the build additionally requires "Newspapers" in `edm:datasetName` —
+which drops **0 records** in the current corpus.
 
 **2. Text records only**
 
@@ -176,12 +170,6 @@ qf=proxy_dcterms_issued:[* TO *]
 Every item must carry a `dcterms:issued` date. This drops exactly **one record** from
 the corpus, and in exchange the whole dataset is partitionable and filterable by year.
 
-> **Trap:** `qf` values on the *same* field are ORed; only different fields are
-> ANDed. This filter must therefore never be sent alongside a year range on the same
-> field — `proxy_dcterms_issued:[* TO *]` plus `[1873 TO 1874}` means "has a date OR
-> is from 1873" and silently matches the entire corpus. The harvest below sends the
-> year range *only*.
-
 ### Combined query
 
 The corpus definition as a single Search API call:
@@ -198,13 +186,9 @@ https://api.europeana.eu/fulltext/search.json
   &cursor=*
 ```
 
-→ `totalResults`: **995,182**. Two parameters are silently unforgiving:
-
-- **`rows` is capped at 100 server-side.** Asking for 500 returns 100, without
-  complaint.
-- **`profile=rich` is required.** `dcTypeLangAware`, `dcSubjectLangAware`, `edmPlace`
-  and `edmTimespan` appear on no lighter profile, and they are the source of every
-  enrichment edge in this dataset.
+→ `totalResults`: **995,182**. `rows` is silently capped at 100 server-side, and
+`profile=rich` is required — no lighter profile returns the enrichment fields
+(`dcTypeLangAware`, `dcSubjectLangAware`, `edmPlace`, `edmTimespan`).
 
 ### Result
 
@@ -218,42 +202,18 @@ https://api.europeana.eu/fulltext/search.json
 | … whose manifests contain canvases | 889 |
 | Pages harvested | 7,001 (6,973 with OCR text) |
 
-## The harvest, step by step
+## Harvest recipe
 
-Five request types against three public APIs — roughly 19,000 requests end-to-end.
-[`build.py`](https://github.com/storytracer/europeana-open-newspapers) automates all
-of it (checkpointed, resumable, HTTP-cached); the endpoints and per-table counts are
-recorded in `data/metadata.json`.
+Four kinds of requests assemble the five tables.
+[`build.py`](https://github.com/storytracer/europeana-open-newspapers) automates
+them end-to-end; the endpoints and per-table counts are recorded in
+`data/metadata.json`.
 
-**Step 1 — count each publication year** (351 requests: the corpus total plus one
-per year, 1600–1949).
+**1. Issue metadata — Fulltext Search API, one query per publication year.**
 
-The publication date can be *filtered* but is never *returned*: `proxy_dcterms_issued`
-is in the index, yet no API profile includes it and `fl` is ignored. Partitioning the
-harvest by year is therefore what gives every item its `year_issued` — not a speed
-optimization.
-
-```
-https://api.europeana.eu/fulltext/search.json
-  ?query=*
-  &theme=newspaper
-  &qf=TYPE:TEXT
-  &qf=proxy_dcterms_issued:[1854 TO 1855}
-  &reusability=open
-  &profile=rich
-  &rows=0
-```
-
-→ `totalResults: 8499`. The range is half-open (`[1854 TO 1855}`) so adjacent years
-can neither overlap nor leave gaps. **Before harvesting anything, assert that the
-per-year counts sum exactly to the corpus total** (995,182) — a filter that silently
-matches too much or too little fails loudly here, instead of shipping a
-plausible-but-wrong dataset.
-
-**Step 2 — drain each year with cursor pagination** (~10,300 requests).
-
-The same query with `rows=100` and `cursor=*`; every response carries a `nextCursor`
-to echo back in the next request:
+The API can *filter* on the publication date but never *returns* it, so the corpus
+is harvested one year at a time and each item's `year_issued` is the year of the
+query that returned it:
 
 ```
 https://api.europeana.eu/fulltext/search.json
@@ -267,70 +227,47 @@ https://api.europeana.eu/fulltext/search.json
   &cursor=*
 ```
 
-Two properties of the cursor matter:
+Each response carries a `nextCursor` to send back in the next request; an empty page
+ends the year. (The year range *replaces* filter 4 rather than joining it: `qf`
+values on the same field are ORed, and "has a date OR is from 1854" would match the
+entire corpus.) The hits become `items.parquet`; the entity URIs in their enrichment
+fields become `enrichments.parquet`.
 
-- **The chain needs one request more than the maths says.** The API returns a
-  `nextCursor` even on the last populated page, so a chain terminates only after a
-  further request comes back empty: `ceil(count / 100) + 1` requests per year.
-- **Cursor pagination is inherently serial** — each request needs the previous
-  response's cursor — so a single chain manages ~1.3 requests/s no matter the rate
-  limit. The 350 year chains run concurrently, which makes the harvest
-  rate-limit-bound instead of latency-bound.
-
-Each hit becomes one row of `items.parquet`: the LangMap literals
-(`dcTitleLangAware`, `dcDescriptionLangAware`, `dcTypeLangAware`), provenance
-(`dataProvider`, `provider`, `edmDatasetName`, `rights`), and one enrichment edge per
-entity URI found under the `def` key of `dcTypeLangAware` / `dcSubjectLangAware` /
-`dcCreatorLangAware` or in `edmConcept` / `edmAgent` / `edmPlace` / `edmTimespan` —
-those edges become `enrichments.parquet`. The hit's `id` also yields the two URL
-columns: `https://www.europeana.eu/item{id}` (`europeana_url`) and
-`https://iiif.europeana.eu/presentation{id}/manifest` (`manifest_url`).
-
-**Step 3 — resolve every linked Europeana entity** (38 requests).
-
-Entity URIs of the form `http://data.europeana.eu/{type}/{id}` resolve via the
-Entity API:
+**2. Entity facts — Entity API, one request per linked `data.europeana.eu` entity.**
 
 ```
 https://api.europeana.eu/entity/place/216254
 ```
 
-→ `prefLabel`/`altLabel` in 30+ languages, `broader`/`narrower`, `sameAs` links to
-Wikidata, GeoNames and VIAF, coordinates for places, date ranges for timespans —
-flattened into `entities.parquet`. (Third-party entity URIs linked directly by
-providers are not resolvable here; they keep their URI in `enrichments.parquet`,
-plus an English label lifted from the search response where the mapping is
-unambiguous.)
+→ labels in 30+ languages, `sameAs` links to Wikidata, GeoNames and VIAF,
+coordinates for places, date ranges for timespans — flattened into
+`entities.parquet`.
 
-**Step 4 — fetch the IIIF Presentation manifest of each sampled issue**
-(1,000 requests, no API key needed).
+**3. Issue structure — IIIF Presentation API, one manifest per sampled issue.**
 
 ```
 https://iiif.europeana.eu/presentation/{collection}/{record}/manifest?format=3
 ```
 
-`format=3` selects IIIF Presentation v3; the exact URL for every issue is in the
-`manifest_url` column. The 1,000 issues are chosen by the stratified sampler
-described under "How the page sample was drawn" below — steps 1–3 cover the full
-corpus, steps 4–5 only the sample. Each canvas is one physical page, carrying the
-page image's URL, dimensions and MIME type, plus — where OCR exists — a reference to
-the page's annotation page. The raw manifests ship in `manifests.parquet`.
+The exact URL for every issue is in the `manifest_url` column; `format=3` selects
+IIIF Presentation v3. Each canvas is one physical page, carrying the page image's
+URL and dimensions plus a reference to its annotation page. The raw manifests ship
+in `manifests.parquet`.
 
-**Step 5 — fetch each page's annotation page with `profile=text`**
-(~7,000 requests, one per page; the API has no batch form).
-
-Take each canvas's `annotations[0].id` and append `profile=text`:
+**4. Page text — IIIF Fulltext API, one annotation page per page, with
+`profile=text`.**
 
 ```
 https://iiif.europeana.eu/presentation/{collection}/{record}/annopage/{n}?lang={lang}&profile=text
 ```
 
-Without the profile the annotations merely *reference* the text; with it, the
-response inlines everything: the page-granularity annotation carries the full page
-text (→ `text` in `pages`), and every block/line/word annotation ties a character
-range in that text (`#char=start,end`) to a pixel region on the page image
-(`#xywh=x,y,w,h`) (→ `annotations`). This one-request-per-page cost is why full-corpus
-text would be ~16.7 million requests and ~950 GB, and pages are sampled instead.
+With `profile=text` the response inlines the full page text and the block/line/word
+annotations tying character ranges (`#char=`) to pixel regions on the page image
+(`#xywh=`) — the `text` and `annotations` columns of `pages`. One request per page
+is why the full corpus (~15.7 million pages) is sampled rather than harvested.
+
+Requests 1–2 cover the full corpus; requests 3–4 only the 1,000-issue sample (see
+"How the page sample was drawn" below).
 
 ## Dataset structure
 
