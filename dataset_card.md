@@ -698,5 +698,4 @@ the State and University Library Hamburg, the Berlin State Library, the Teßmann
 Library, the National Library of Latvia, the National Library of Estonia, the
 National Library of Finland, the University of Belgrade, the National Library of
 Poland and the National Library of Luxembourg — aggregated and enriched by
-[Europeana](https://www.europeana.eu/). Dataset compiled by Sebastian Majstorovic
-from Europeana's public APIs.
+[Europeana](https://www.europeana.eu/).
