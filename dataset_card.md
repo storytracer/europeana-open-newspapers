@@ -62,10 +62,11 @@ issue-level metadata for the whole corpus, semantic enrichment resolved to the
 and **full OCR page text with word-level bounding-box annotations for a stratified,
 deterministic sample of 1,000 issues (7,001 pages, ~98 million characters)**.
 
-Every issue in the corpus has OCR text that Europeana has ingested into its Fulltext
-API — page text at full-corpus scale would be ~15.7 million pages and ~950 GB, which
-is why pages are sampled, deliberately and reproducibly: the same build always selects
-the same issues.
+Every issue in the corpus has OCR text — held by Europeana's Fulltext API, from which
+it remains retrievable per issue. This dataset does not ship all of it: at full-corpus
+scale the page text would run to ~15.7 million pages and ~950 GB. Instead, page text is
+included for a 1,000-issue sample, drawn deliberately and reproducibly — the same build
+always selects the same issues.
 
 > **Snapshot:** Harvested from Europeana's public APIs on 2026-07-13.
 
@@ -111,9 +112,13 @@ The corpus is defined against Europeana's
 (`https://api.europeana.eu/fulltext/search.json`) — **not** the general
 `record/v2/search.json`. Only records whose OCR was ingested into Europeana's
 Fulltext API are served there, and only those have IIIF AnnotationPages, i.e.
-retrievable page text. (The general Search API's `text_fulltext=true` flag marks a
-different, largely disjoint set: records whose *media file* is text-searchable,
-whose OCR was never ingested.)
+retrievable page text.
+
+Beware of a look-alike: the general Search API offers a `text_fulltext=true` flag,
+but it marks something else — records whose attached *media file* (typically a PDF)
+contains searchable text. For most of those records the OCR was never ingested into
+the Fulltext API, so they have no AnnotationPages and no retrievable page text. The
+two sets are largely disjoint; this corpus is the ingested one.
 
 The selection filters are expressed below as API queries. The Search and Entity APIs
 require a free [API key](https://pro.europeana.eu/page/get-api), sent as an
@@ -155,8 +160,11 @@ currently **0**.
 qf=TYPE:TEXT
 ```
 
-`TYPE` is a Solr String field carrying the normalized five-value enum (TEXT, IMAGE,
-SOUND, VIDEO, 3D) from `edm:type` on the Europeana proxy.
+`TYPE` is a Solr String field carrying the normalized five-value media-type enum
+(TEXT, IMAGE, SOUND, VIDEO, 3D) from `edm:type` on the Europeana proxy. The filter is
+needed because `theme=newspaper` says nothing about the media type — as described
+above, the "Newspaper" concept also tags photographs *of* newspapers. This filter
+keeps only records whose primary media is text.
 
 **3. Open reuse rights only**
 
@@ -174,8 +182,12 @@ record carries the Public Domain Mark.
 qf=proxy_dcterms_issued:[* TO *]
 ```
 
-Every item must carry a `dcterms:issued` date. This drops exactly **one record** from
-the corpus, and in exchange the whole dataset is partitionable and filterable by year.
+Every item must carry a `dcterms:issued` date. The reason is structural: the harvest
+runs one query per publication year (see the recipe below), which is both how the
+corpus is collected and where each item's `year_issued` comes from — an undated item
+would be invisible to every year query. This filter makes the corpus *definition*
+match what the year-partitioned harvest can actually reach. The cost is exactly
+**one record**; in exchange, every item in the dataset has a publication year.
 
 ### Combined query
 
@@ -206,7 +218,7 @@ https://api.europeana.eu/fulltext/search.json
 | … skipped as non-newspaper collections | 0 |
 | Page sample: issues selected | 1,000 |
 | … with retrievable IIIF manifests | 1,000 |
-| … whose manifests contain canvases | 889 |
+| … whose manifests contain canvases (physical pages) | 889 |
 | Pages harvested | 7,001 (6,973 with OCR text) |
 
 ## Harvest recipe
@@ -363,8 +375,11 @@ labels with the source property preserved:
 **Every issue has an exact publication date**, obtained twice over: `year_issued`
 comes from Europeana's date index (via the harvest partition — the API never returns
 the date field itself), and `date_issued` is parsed from the issue title, which ends
-in the date in all 11 collections. The two agree for 995,181 of 995,182 issues; the
-single disagreement (across a New Year boundary) is kept as harvested.
+in the date in all 11 collections. The two agree for 995,181 of 995,182 issues. In
+the single disagreement, the date printed in the title and the date in Europeana's
+index fall on opposite sides of a January 1st, one year apart; both values are kept
+exactly as the sources report them (`year_issued` from the index, `date_issued` from
+the title), so the row shows the discrepancy rather than hiding it.
 
 ### `enrichments` — item→entity edges (full corpus)
 
@@ -397,8 +412,10 @@ and other authority files.
 | `manifest` | string | the complete IIIF Presentation (v3) manifest as JSON |
 
 Included as provenance: the manifests are the exact source documents the `pages` rows
-were derived from — including, for the 111 sampled issues without any pages, the
-canvasless manifests that explain their absence.
+were derived from. That includes the 111 sampled issues that yielded no pages at all
+(explained under "How the page sample was drawn" below): their manifests list no
+canvases — no pages to harvest — and are preserved here as the evidence for why those
+issues are absent from `pages`.
 
 ## How the tables relate
 
@@ -481,7 +498,9 @@ lopsided in three directions at once (a third of it is one Dutch collection, the
    deterministic. The same parameters always select the same issues.
 
 The result covers **all 34 decades (1610s–1940s), all 11 collections and ~320 distinct
-newspapers** — a coverage that holds even among the issues with page text:
+newspapers**. Notably, that coverage survives the upstream losses described below: 111
+of the selected issues turn out to have no retrievable pages, yet the issues that *do*
+carry page text still span every decade and every collection:
 
 | collection | corpus share | sampled | | collection | corpus share | sampled |
 |---|---|---|---|---|---|---|
@@ -557,8 +576,10 @@ pattern for further Europeana full-text datasets.
 
 `items` carries the provider's literals (`dc_title`, `dc_type` as LangMaps) *and*
 Europeana's enrichment (`enriched_*`, `dc_*_en`) side by side, so the value the
-library wrote and the entity Europeana resolved it to are both visible in every row —
-and the edge-level provenance survives in `enrichments.parquet`.
+library wrote and the entity Europeana resolved it to are both visible in every row.
+`enrichments.parquet` preserves the provenance of each link: for every item–entity
+pair it records which metadata property (`dc_subject`, `dcterms_spatial`, …) the
+entity was resolved from.
 
 ### The publication date is obtained twice, deliberately
 
@@ -591,10 +612,12 @@ row, including for the issues that yielded no pages.
 
 ### Determinism over convenience
 
-Issue selection hashes item ids with md5 (not Python's salted `hash()`), strata are
-iterated in sorted order, and the API's per-year counts are reconciled against the
-corpus total before anything is written. The result: the dataset is exactly
-reproducible from the public APIs with the published build script.
+Issue selection hashes item ids with md5 rather than Python's built-in `hash()` —
+the built-in is salted differently in every process, so a sample drawn with it could
+never be reproduced. Strata are iterated in sorted order, and the API's per-year
+counts are reconciled against the corpus total before anything is written. The
+result: the dataset is exactly reproducible from the public APIs with the published
+build script.
 
 ## Provenance and reproducibility
 
