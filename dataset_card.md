@@ -503,17 +503,17 @@ weighted accordingly (or computed on `items`, which is complete).
 
 | collection (edm:datasetName) | institution | issues |
 |---|---|---|
-| `9200359_…_Newspapers_Netherlands` | National Library of the Netherlands | 325,656 |
-| `9200300_…_Newspapers_ONB` | Austrian National Library | 147,518 |
-| `9200338_…_Newspapers_HamburgLibrary` | State and University Library Hamburg | 131,076 |
-| `9200355_…_Newspapers_Berlin` | Berlin State Library | 116,456 |
+| `9200359_Ag_EU_TEL_a0601_Newspapers_Netherlands` | National Library of the Netherlands | 325,656 |
+| `9200300_Ag_EU_TEL_a0600_Newspapers_ONB` | Austrian National Library | 147,518 |
+| `9200338_Ag_EU_TEL_a0621_Newspapers_HamburgLibrary` | State and University Library Hamburg | 131,076 |
+| `9200355_Ag_EU_TEL_a0620_Newspapers_Berlin` | Berlin State Library | 116,456 |
 | `9200333_Newspapers_TessmannLibrary` | Teßmann Library (South Tyrol) | 114,771 |
-| `9200303_…_Newspapers_Latvia` | National Library of Latvia | 68,661 |
-| `9200356_…_Newspapers_Estonia` | National Library of Estonia | 28,128 |
-| `9200301_…_Newspapers_Finland` | National Library of Finland | 24,196 |
-| `9200339_…_Newspapers_Belgrade` | University of Belgrade | 22,273 |
-| `9200357_…_Newspapers_poland` | National Library of Poland | 15,130 |
-| `9200396_…_Newspapers_Luxembourg` | National Library of Luxembourg | 1,317 |
+| `9200303_Ag_EU_TEL_a0617_Newspapers_Latvia` | National Library of Latvia | 68,661 |
+| `9200356_Ag_EU_TEL_a0616_Newspapers_Estonia` | National Library of Estonia | 28,128 |
+| `9200301_Ag_EU_TEL_a0611_Newspapers_Finland` | National Library of Finland | 24,196 |
+| `9200339_Ag_EU_TEL_a0622_Newspapers_Belgrade` | University of Belgrade | 22,273 |
+| `9200357_Ag_EU_TEL_a0618_Newspapers_poland` | National Library of Poland | 15,130 |
+| `9200396_Ag_EU_TEL_a0639_ft_Newspapers_Luxembourg` | National Library of Luxembourg | 1,317 |
 
 ### Languages
 
