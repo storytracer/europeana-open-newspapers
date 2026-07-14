@@ -137,10 +137,17 @@ theme=newspaper
 NOT (foaf_organization:(...19 excluded organisations...))
 ```
 
-The `proxy_dc_type` branch matches *any* item typed
-[concept/18 ("Newspaper")](http://data.europeana.eu/concept/18) regardless of
-collection, so the build additionally requires "Newspapers" in `edm:datasetName` —
-which drops **0 records** in the current corpus.
+The `proxy_dc_type` branch of this alias matches *any* item typed
+[concept/18 ("Newspaper")](http://data.europeana.eu/concept/18), regardless of the
+collection it comes from — and the tag is not confined to newspaper collections. It
+also appears on items that merely *depict* newspapers, such as a crowdsourced photo
+archive of 1989 Germany whose photographs carry `dc:type` "Newspaper". As a safeguard
+against such strays, the build keeps an item only if its `edm:datasetName` contains
+"newspapers" (case-insensitive), which is true of every genuine newspaper collection
+in the corpus. In practice the safeguard never fires: the known strays have no
+ingested OCR, so the Fulltext API does not serve them in the first place. Any record
+it does drop is counted in `data/metadata.json` as `skipped_non_newspaper_datasets` —
+currently **0**.
 
 **2. Text records only**
 
